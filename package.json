@@ -1,0 +1,34 @@
+{
+  "name": "mask-studio",
+  "version": "1.0.0",
+  "description": "Mask Studio — standalone testbed for the phosmith megashader masking engine with on-device AI",
+  "type": "module",
+  "private": true,
+  "packageManager": "bun@1.3.11",
+  "scripts": {
+    "build": "bun run build.mjs",
+    "serve": "bun run serve.mjs",
+    "dev": "bun run build.mjs && bun run serve.mjs",
+    "setup:ort": "mkdir -p ort && cp ../phosmith/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded*.mjs ort/ && cp ../phosmith/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded*.wasm ort/ && echo 'ORT WASM files copied to ort/'"
+  },
+  "dependencies": {
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "framer-motion": "^12.38.0",
+    "@huggingface/transformers": "^4.2.0",
+    "onnxruntime-web": "^1.21.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "keywords": [
+    "mask",
+    "ai",
+    "segmentation",
+    "onnxruntime",
+    "megashader",
+    "react",
+    "webgpu"
+  ],
+  "license": "UNLICENSED"
+}
