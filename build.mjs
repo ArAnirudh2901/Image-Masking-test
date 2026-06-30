@@ -31,6 +31,18 @@ const aliasPlugin = {
             const mapped = './' + path.join('hooks', args.path.slice('@hooks/'.length))
             return { path: Bun.resolveSync(mapped, REPO) }
         })
+        // Dedupe React to a SINGLE copy. The entry (app.jsx) resolves `react`
+        // from Image-Masking-test/node_modules while the @/-aliased phosmith
+        // components resolve it from phosmith/node_modules, so Bun bundles TWO
+        // React instances — the second's exports are null at runtime, crashing
+        // with "Cannot read properties of null (reading 'useState')" in
+        // LayerGradeEditor. Pin all React imports to the phosmith copy so there
+        // is exactly one. (Only react* — NOT @huggingface/transformers, whose
+        // node/browser build variant must keep resolving from the entry.)
+        build.onResolve(
+            { filter: /^(react|react-dom|scheduler)(\/.*)?$/ },
+            (args) => ({ path: Bun.resolveSync(args.path, REPO) }),
+        )
     },
 }
 
