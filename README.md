@@ -1,15 +1,26 @@
 # 🎭 Mask Studio
 
-A standalone, no-auth testbed for the **phosmith megashader masking engine** — load an image, build a stack of masks of every kind, and colour-grade each masked region in real-time using the production mask card UI.
+Load an image, stack masks of every kind — geometric, parametric, freehand and
+**AI** — and colour-grade each masked region in real time with the production
+mask card UI.
 
-This is the real editor engine running in isolation, outside of the full app, for rapid development and testing.
+Two engines, spliced:
+
+| | |
+|---|---|
+| **phosmith megashader** | the mask compositing + 13-parameter per-mask grade, tone curves, colour wheels, and the real editor UI (`MaskChainCard`, `LayerGradeEditor`, `ProRulerSlider`) |
+| **seglab lane** (`ai/`) | on-device segmentation: **SAM 2.1 small, fp16, WebGPU**, bounded decode workers, C++/wasm mask refinement, a one-job-at-a-time heavy queue and a live memory governor |
+
+**Everything runs in this browser.** There is no upload endpoint, no Python
+service and — once `bun run models` has vendored the weights — no network call
+at all. Images, masks and every inference stay on the device.
 
 ---
 
-## ✨ Features
+## ✨ Tools
 
-### Mask Types
-| Tool | Description |
+### Masks
+| Tool | What it does |
 |---|---|
 | **Radial** | Ellipse / circle gradient — drag handles to resize & rotate |
 | **Linear** | Linear gradient — drag endpoints to aim |
@@ -17,170 +28,179 @@ This is the real editor engine running in isolation, outside of the full app, fo
 | **Pen / Lasso** | Click points to build a path, close to commit |
 | **Luminance** | Tonal range selection (highlights / shadows / midtones) |
 | **Color** | Colour range — click the image to sample the target hue |
-| **AI Subject** | Auto-masks the main subject (on-device RMBG or SAM 3.1 via service) |
-| **AI Sky / Bg** | Detects the subject and inverts — selects sky / background |
-| **AI Click-Select** | Click any object for a precise mask (SlimSAM, on-device) |
-| **AI Depth** | Near / far depth-based selection (Depth-Anything, on-device) |
+| **AI Subject** | The main subject, from three SAM prompts over one cached encode |
+| **AI Sky / Bg** | The same mask, inverted — the only reliable "whole background" selection |
+| **AI Click-Select** | Click any object; click again to **add**, Alt+click to **remove** |
+| **AI Box-Select** | Drag a box around an object |
+| **AI Lasso** | Draw a rough loop — it snaps to the object and can never bleed outside it |
+| **AI Text** | Describe an object ("the red car"); an on-device open-vocab detector finds every instance and SAM segments them |
 
-### Per-Mask Grading (13 parameters)
-- Exposure, Contrast, Highlights, Shadows, Whites, Blacks
-- Saturation, Vibrance, Hue Shift
-- Tone Curves (per-channel RGB + composite)
-- Colour Wheels (Shadows / Midtones / Highlights)
-- Gamma
+Every AI mask is an ordinary mask afterwards: grade it, invert it, grow/shrink
+its **Boundary**, or **Brush-refine** its coverage by hand.
 
-### AI Backends
-- **On-device** (WebGPU → WASM fallback) — no server needed, fully private
-- **Local Python service** — SAM 3.1 / SAM 2 / Depth Anything / CLIPSeg via FastAPI (preferred when running, for higher quality)
+### Per-mask grading (13 parameters)
+Exposure · Contrast · Highlights · Shadows · Whites · Blacks · Saturation ·
+Vibrance · Hue Shift · Tone Curves (per-channel RGB + composite) · Colour
+Wheels (Shadows / Midtones / Highlights) · Gamma
 
-### Other
+### Everything else
 - Multi-mask stacking with per-layer blend ops (`add`, `subtract`, `replace`)
-- Full undo / redo including brush strokes and AI mask textures
-- Boundary grow / shrink on any texture mask
+- Full undo / redo **including** brush strokes and AI mask textures
 - Overlay mode + clean preview (hide all handles)
-- Global invert, fill colour per-mask
+- Global invert, fill colour per mask
+- **HD export** — re-decodes the original at export resolution and renders the
+  whole chain onto it
+- Drop or paste an image anywhere; **camera RAW** (`.nef/.cr2/.cr3/.arw/.dng/…`)
+  opens through its embedded preview, or an on-device LibRaw develop
 
 ---
 
-## 🗂️ Project Structure
+## 🚀 Quick start
 
-```
-mask-studio/
-├── app.jsx          # Main React application (single file)
-├── styles.css       # All UI styles
-├── index.html       # Entry point
-├── build.mjs        # Bun bundler script (resolves @/ alias from phosmith/src)
-├── serve.mjs        # Tiny static server with correct MIME types for .wasm
-└── ort/             # ONNX Runtime WASM files (NOT committed — see Setup)
+Prerequisites: [Bun](https://bun.sh) and the `phosmith/` repo checked out as a
+sibling directory (the bundler resolves `@/` → `../phosmith/src/`).
+
+```bash
+bun install            # React, react-dom, framer-motion
+bun run models         # one-time: vendors ~227 MB of ORT + SAM 2.1 + detector weights
+bun run dev            # build.mjs → app.js, then serve.mjs on :8810
 ```
 
-> **Note:** This project lives alongside and imports directly from the `phosmith/` repo (its parent directory). The bundler resolves `@/` → `../phosmith/src/` at build time.
+Open **http://127.0.0.1:8810**. Drop in any photo, or add a `test.png` to have
+one auto-load.
+
+`bun run models` is what makes the app work **with no internet**. It vendors
+onnxruntime-web under `lib/` and the weights under `models/` (both gitignored).
+Skip it and the app falls back to the pinned CDN on first use, caching into
+Cache Storage via `sw.js` — which survives reloads but is evictable.
+
+### Requirements
+
+**WebGPU with `shader-f16` is required, not preferred.** The mask lane is
+fp16-only; there is no WASM fallback and no second segmentation model, because a
+second one would break the bounded interaction-memory contract. Chrome/Edge 121+
+and Safari 18+ on Apple Silicon qualify.
 
 ---
 
-## 🚀 Quick Start
+## 🏗 How the two engines meet
 
-### Prerequisites
-- [Bun](https://bun.sh) (v1.0+)
-- The `phosmith/` repo checked out at `../phosmith` (sibling directory)
+`ai/studio-bridge.js` is the **only** module the React bundle talks to. It is a
+translation layer, not a second implementation:
 
-### 1. Install dependencies
-
-```bash
-# In the phosmith repo (installs React, framer-motion, transformers, etc.)
-cd ../phosmith
-bun install
+```
+seglab                                   Mask Studio
+──────────────────────────────────────   ────────────────────────────────────
+white-on-black RGBA ImageData        →   the opaque mask canvas the megashader
+  (R=G=B=coverage, A=255)                  semantic shader already samples
+click / box / lasso prompt sets      →   one select() per mask tool
+asset-store blob custody + proxy     →   the working canvas React grades
+policy budget + memory governor      →   the status chip in the panel
 ```
 
-### 2. Copy ONNX Runtime WASM files
+The mask formats are already identical, so a mask crosses between engines as a
+`putImageData` — there is no resample and no quality loss anywhere in the path.
 
-The on-device AI models need the ONNX Runtime WASM runtime files served locally. Copy them from the `onnxruntime-web` package:
+### `ai/` is deliberately **not bundled**
 
-```bash
-cd /path/to/mask-studio
-
-# Copy the 4 WASM + 4 .mjs files from node_modules
-cp ../phosmith/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded*.{mjs,wasm} ort/
-```
-
-### 3. Build the app
-
-```bash
-bun build.mjs
-```
-
-This bundles `app.jsx` → `app.js` (+ chunk files) using the phosmith source alias.
-
-### 4. Start the frontend server
-
-```bash
-bun serve.mjs
-```
-
-Open **http://127.0.0.1:8810** in your browser.
+The lane resolves its workers, wasm and weights with
+`new URL(…, import.meta.url)`. Bundling would rewrite those to point at
+`app.js`'s directory and break every worker spawn and model fetch. So `app.jsx`
+reaches the bridge through a runtime `import(<computed URL>)`, which Bun leaves
+alone, and `serve.mjs` serves `ai/*.js` as real ES modules. `index.html`
+`modulepreload`s the bridge so the graph is warm before the first click.
 
 ---
 
-## 🤖 Optional: Python AI Service (Higher Quality)
+## ⚡ Why it stays smooth
 
-The Python backend enables SAM 3.1 / SAM 2 / Depth Anything / CLIPSeg — significantly better results than the on-device models for subject masking and click-select. The frontend falls back to on-device automatically when the service is not running.
+- **One heavy job at a time** (`ai/heavy-job-queue.js`) — proxy decode, model
+  warm, encode, detector runs, wasm refinement and export re-decodes are
+  serialised at concurrency 1, so their peak allocations can never stack.
+  Import outranks model work; user interaction outranks speculative prewarm; a
+  new image invalidates stale queued jobs.
+- **Encode once, decode per click.** The image embedding is content-keyed and
+  cached, so the expensive ViT pass runs once per photo and every later click,
+  box, lasso or refine is a decoder pass. Measured on the sample: 3.2 s cold
+  encode, then **270–470 ms** per selection.
+- **The original is bytes, never RGBA.** `asset-store` keeps the upload as a
+  compressed Blob and decodes straight to a bounded proxy; crops and exports
+  re-decode only the region they need. A 45 MP frame never materialises.
+- **Per-axis proxy sizing.** SAM 2.1 encodes a 1024×1024 square, so a long-edge
+  cap starves the short axis. The proxy is sized to put the **short** edge at
+  1024 (bounded by a 2048 long-edge stop and a ~2.1 MP total cap): the sample
+  lands at 1756×1024 instead of a flat 1400×816.
+- **Cross-origin isolated.** `serve.mjs` sets COOP/COEP, which unlocks threaded
+  WASM and `measureUserAgentSpecificMemory()` — the only real byte signal the
+  governor has. Everything is vendored, so isolation costs nothing.
+- **A live memory governor** (`ai/memory-governor.js`) watches measured bytes,
+  an allocation ledger and timer drift, and sheds — detector → refine →
+  embedding → sessions — the moment real pressure appears. It is a one-way
+  ratchet; it never re-enables a feature behind your back.
+- **Idle hibernate.** The resident cost between edits is the ORT session arena,
+  not the 8 MB embedding, so after an idle window the arena goes back to the OS.
+  The next selection rebuilds from cached weights; nothing on screen is lost.
+- **Long-cached weights, no-cache build output.** Model blobs are served
+  `immutable` with Range support; `app.js` and `index.html` are always fresh.
 
-### Setup (one-time)
+---
 
-```bash
-cd ../phosmith/services/segment
+## 🗂 Layout
 
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-
-# Install dependencies (torch, transformers, rembg, fastapi, etc.)
-pip install -r requirements.txt
+```
+Image-Masking-test/
+├── app.jsx           # the React app (bundled → app.js)
+├── ai/               # the seglab engine, verbatim + studio-bridge.js
+│   ├── studio-bridge.js    ← the only entry point app.jsx uses
+│   ├── sam-client.js · sam21-{lane,host,client,adapter,store}.js
+│   ├── sam-core.js · mask-select.js · mask-refine.js · cv-refine-*.js
+│   ├── decode-{client,core,worker}.js · image-io.js · image-raw.js · raw-develop-*.js
+│   ├── asset-store.js · export-hd.js · proxy-plan.js
+│   ├── policy.js · capability.js · memory-governor.js · heavy-job-queue.js
+│   └── text-*.js · yoloe-detect.js · clip-tokenizer.js · detect-worker.js
+├── lib/ort-web/      # vendored onnxruntime-web  (bun run models)
+├── models/           # SAM 2.1 + CLIP text + YOLOE weights  (bun run models)
+├── public/wasm/      # cv-refine + LibRaw develop, compiled from C++
+├── sw.js             # model cache + CORP re-tag for the CDN fallback
+├── build.mjs · serve.mjs · styles.css · index.html
 ```
 
-### Start the service
+## 🔧 Development
 
 ```bash
-cd ../phosmith/services/segment
-source .venv/bin/activate
-uvicorn main:app --reload --port 8001
+bun run build.mjs   # rebuild app.js after editing app.jsx / styles.css
+# ai/*.js needs NO rebuild — it is served straight from disk. Just refresh.
 ```
 
-The service will be available at **http://127.0.0.1:8001**.
+`window.__studio` exposes every action for scripted testing: `clickSelect`,
+`samBox`, `aiLasso`, `runSubject`, `background`, `findText`, `exportHd`,
+`engine()`, `budget()`, `shed(level)`, `undo`, `redo`, `pixels()`.
 
-> **First run:** Models are downloaded lazily on first use:
-> - `isnet-general-use` background removal (~179 MB) — downloaded on first *AI Subject* call
-> - `facebook/sam2-hiera-small` (~180 MB) — downloaded on first *AI Click-Select* call
-> - `depth-anything/Depth-Anything-V2-Small-hf` (~50 MB) — downloaded on first *AI Depth* call
+### URL parameters
 
-### Hardware acceleration
+Safety precedence is **hard device limit > memory pressure > URL parameter >
+feature request**; parameters may only ever lower a limit.
 
-| Machine | Detected provider |
+| | |
 |---|---|
-| macOS Apple Silicon | CoreML + MPS (GPU) |
-| Linux + NVIDIA GPU | CUDA |
-| Anything else | CPU |
-
-### API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Service status + loaded models |
-| `POST` | `/segment` | Background removal (RGBA PNG) |
-| `POST` | `/segment/instances` | Subject concept segmentation (SAM 3.1 / saliency) |
-| `POST` | `/sam2/click` | Click-to-select mask (SAM 2) |
-| `POST` | `/depth` | Depth map estimation |
-| `POST` | `/ground/text` | Text-grounded masking (CLIPSeg + SAM 2) |
+| `?proxy=768` | smaller interaction frame |
+| `?text=0` | disable the text lane entirely |
+| `?escalate=0` | no native re-decode escalation |
+| `?debug=1` | governor telemetry in the console |
 
 ---
 
-## 🔧 Development Workflow
-
-```bash
-# 1. Edit app.jsx or styles.css
-# 2. Rebuild
-bun build.mjs
-
-# 3. The dev server (bun serve.mjs) serves the new build immediately — just refresh the browser
-```
-
----
-
-## 📦 What's NOT in the repo
+## 📦 Not in the repo
 
 | Item | Why | How to get it |
 |---|---|---|
-| `ort/` | ~77 MB WASM runtime | Copy from `onnxruntime-web` package (see Setup) |
-| `app.js`, `chunk-*.js` | Build output | Run `bun build.mjs` |
-| `node_modules/` | Dependencies | Run `bun install` in `../phosmith` |
-| `test.png` | Large sample image | Add any image locally and rename to `test.png` |
-
----
+| `lib/ort-web/`, `models/` | ~227 MB of runtime + weights | `bun run models` |
+| `app.js` | build output | `bun run build.mjs` |
+| `node_modules/` | dependencies | `bun install` |
+| `test.png` | large sample image | drop in any photo |
 
 ## 🔗 Related
 
-- **phosmith** — the main Next.js photo editing application this testbed is extracted from
-- [ONNX Runtime Web](https://onnxruntime.ai/docs/get-started/with-javascript/web.html)
-- [Hugging Face Transformers.js](https://huggingface.co/docs/transformers.js)
-- [SAM 2 (facebook/sam2-hiera-small)](https://huggingface.co/facebook/sam2-hiera-small)
-- [Depth Anything V2](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf)
+- **phosmith** — the Next.js photo editor this masking engine comes from
+- **seglab** — the on-device segmentation app `ai/` is lifted from
+- [SAM 2.1](https://github.com/facebookresearch/sam2) · [ONNX Runtime Web](https://onnxruntime.ai/docs/get-started/with-javascript/web.html) · [LibRaw](https://github.com/libraw/libraw)

@@ -6,6 +6,12 @@
  * Bun's CLI bundler only reads tsconfig.json paths, and this project uses
  * jsconfig.json (adding a root tsconfig.json would flip Next into TS mode),
  * so we resolve `@/` → `<repo>/src/` with a tiny onResolve plugin instead.
+ *
+ * `ai/` is DELIBERATELY NOT BUNDLED. The segmentation lane resolves its
+ * workers, wasm and weights with `new URL(…, import.meta.url)`; bundling would
+ * rewrite those to point at app.js's directory and break every worker spawn and
+ * model fetch. app.jsx reaches it through a runtime `import(<computed url>)`,
+ * which Bun leaves alone, and serve.mjs serves `ai/*.js` as real ES modules.
  */
 import path from 'node:path'
 import { readdirSync, rmSync } from 'node:fs'
@@ -49,15 +55,18 @@ const aliasPlugin = {
 const result = await Bun.build({
     entrypoints: [path.join(import.meta.dir, 'app.jsx')],
     outdir: import.meta.dir,
-    // `splitting` lets the heavy on-device-AI module (client-ai.js +
-    // transformers.js) load as a lazy chunk via dynamic import(), so the core
-    // studio (React + megashader + MaskChainCard) is small and loads instantly.
+    // Nothing heavy is left to split out — the segmentation engine is served
+    // unbundled from ai/ — but splitting stays on so any future dynamic import()
+    // inside the React tree lands in its own chunk rather than the entry.
     splitting: true,
     naming: { entry: 'app.js', chunk: 'chunk-[hash].js', asset: '[name]-[hash].[ext]' },
     format: 'esm',
     target: 'browser',
-    minify: false,
-    sourcemap: 'none',
+    // Minified, with an external sourcemap so the bundle stays debuggable — the
+    // unminified entry was 1432 KB of parse work before first paint. `ai/` is not
+    // bundled, so the segmentation lane's own names survive in profiles either way.
+    minify: !process.env.NO_MINIFY,
+    sourcemap: 'linked',
     plugins: [aliasPlugin],
     define: { 'process.env.NODE_ENV': '"production"' },
 })

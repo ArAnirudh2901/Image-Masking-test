@@ -1,27 +1,30 @@
 /**
  * Mask Studio — standalone, no-auth testbed for the phosmith megashader masking
- * engine. Loads an image, lets you add MULTIPLE masks of every client-side kind
- * (radial / linear / pen·lasso / brush / luminance / color), draw each region on
- * the canvas, and colour-grade ONLY that region with the REAL phosmith mask card
+ * engine. Loads an image, lets you add MULTIPLE masks of every kind (radial /
+ * linear / pen·lasso / brush / luminance / color / AI), draw each region on the
+ * canvas, and colour-grade ONLY that region with the REAL phosmith mask card
  * (ProRulerSlider + MaskChainCard + the per-layer adjustment sliders).
  *
- * Reuses the production modules verbatim — this is the now-fixed engine + the
- * real editor UI in isolation, for later integration into the app.
+ * Two production engines spliced together, both verbatim:
+ *   · phosmith  — the megashader mask/grade engine + the real editor UI.
+ *   · seglab    — the on-device segmentation stack under `ai/`: SAM 2.1 fp16 on
+ *                 WebGPU, bounded decode workers, wasm mask refinement, a
+ *                 one-at-a-time heavy-job queue and a live memory governor.
  *
- * Phase A: core masks + the 13-field per-mask grade + multi-mask stacking.
- * (On-device AI + tone-curves/colour-wheels engine extension land next.)
+ * Everything runs in the browser. There is no upload endpoint, no Python
+ * service and no CDN model fetch on the vendored path — see `ai/studio-bridge.js`
+ * for the whole surface this file is allowed to touch.
  */
-import React, { useState, useRef, useEffect, useCallback } from 'react'
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AnimatePresence } from 'framer-motion'
-import { renderMegashader } from '@/lib/megashader/megashader-renderer'
+import { renderMegashader, getRenderMetrics, resetRenderMetrics } from '@/lib/megashader/megashader-renderer'
 import {
     radialLayer, linearLayer, pathLayer, lassoLayer, brushLayer,
-    luminanceLayer, colorLayer, semanticLayer, depthLayer, smartBrushLayer,
-    sanitiseLayer, setMaskTexture, getMaskTexture,
+    luminanceLayer, colorLayer, semanticLayer, smartBrushLayer,
+    sanitiseLayer, setMaskTexture, getMaskTexture, getMaskTextureVersion,
 } from '@/lib/megashader/mask-types'
 import { growMaskCanvas } from '@/lib/mask-grow'
-import { cleanSubjectMatte } from '@/lib/subject-mask-cleanup'
 import { rasterisePath, smoothToBezier } from '@/lib/megashader/path-raster'
 import { buildPackedLutFromCurves } from '@/lib/curve-lut'
 import { computeImageHistogram } from '@/lib/image-histogram'
@@ -31,9 +34,19 @@ import {
 import { LayerGradeEditor } from '@/app/(main)/editor/[projectId]/_components/tools/_layer-grade-editor.jsx'
 import { rgbToHsb } from '@/lib/color-utils'
 
-const MAX_DIM = 1400
 const ACCENT = '#53d8ff'
 const uid = () => Math.random().toString(36).slice(2, 9)
+
+/**
+ * The seglab engine, loaded through a RUNTIME import so Bun leaves it alone.
+ * Its lane resolves workers and weights with `new URL(…, import.meta.url)`,
+ * which only holds while `ai/*.js` is served from its real path — bundling it
+ * into app.js would rewrite those URLs and break every worker and model fetch.
+ */
+let bridgePromise = null
+const engine = () => (bridgePromise ??= import(
+    /* @vite-ignore */ new URL('ai/studio-bridge.js', document.baseURI).href
+))
 
 // True when a layer carries any grade the engine renders (gamma ≠ 1, a tone
 // curve, or a non-zero colour wheel). Used to skip the base pre-grade pass when
@@ -56,12 +69,18 @@ const MASK_TOOLS = [
     { id: 'pen', kind: 'path', label: 'Pen / Lasso', hint: 'click points · close' },
     { id: 'luminance', kind: 'luminance', label: 'Luminance', hint: 'tonal range' },
     { id: 'color', kind: 'color', label: 'Color', hint: 'colour range · click to sample' },
-    { id: 'subject', kind: 'semantic', label: 'AI Subject', hint: 'auto-mask the subject (on-device)', ai: 'subject' },
-    { id: 'background', kind: 'semantic', label: 'AI Sky / Bg', hint: 'select the ENTIRE sky / background (detect the subject, then invert)', ai: 'background' },
-    { id: 'sam', kind: 'semantic', label: 'AI Box-Select', hint: 'drag a box around an object (SAM 3.1)', ai: 'sam' },
-    { id: 'clickselect', kind: 'semantic', label: 'AI Click-Select', hint: 'click any object for a precise mask (multi-point)', ai: 'clickselect' },
-    { id: 'depth', kind: 'depth', label: 'AI Depth', hint: 'near / far selection (on-device)', ai: 'depth' },
+    { id: 'subject', kind: 'semantic', label: 'AI Subject', hint: 'auto-mask the main subject (SAM 2.1, on-device)', ai: 'subject' },
+    { id: 'background', kind: 'semantic', label: 'AI Sky / Bg', hint: 'select the ENTIRE sky / background (mask the subject, then invert)', ai: 'background' },
+    { id: 'clickselect', kind: 'semantic', label: 'AI Click-Select', hint: 'click any object · click again to add · Alt+click to remove', ai: 'clickselect' },
+    { id: 'sam', kind: 'semantic', label: 'AI Box-Select', hint: 'drag a box around an object', ai: 'sam' },
+    { id: 'ailasso', kind: 'semantic', label: 'AI Lasso', hint: 'draw a rough loop — it snaps to the object and can never bleed outside', ai: 'ailasso' },
 ]
+
+// Banner titles for the transient on-canvas modes (tool ids are terse).
+const TOOL_TITLE = {
+    sam: 'box-select', clickselect: 'click-select', ailasso: 'ai lasso',
+    refine: 'brush-refine', pen: 'pen', brush: 'brush', color: 'color',
+}
 
 // ── geometry helpers for on-canvas mask handles (all in image-space px) ──────
 const HANDLE_PX = 9 // on-screen handle hit/half-size, converted to image px per use
@@ -101,207 +120,61 @@ const distToSeg = (a, b, p) => {
 // underneath stay visible. Thresholds the coverage (luma for opaque masks, or
 // alpha for the painted-alpha brush) into a silhouette, dilates it around a ring
 // of offsets, then punches the interior back out — leaving just the edge.
-const drawMaskBoundary = (g, tex, W, H, ipx) => {
-    if (!tex || !tex.width) return
+// Tracing the boundary costs two full-size canvases, a getImageData, a per-pixel
+// JS pass and 16 dilation draws — far too much to repeat per frame while a mask is
+// merely SELECTED. Memoised on the texture's content version (so a brush stroke
+// still invalidates it) plus the geometry that changes its appearance.
+const boundaryCache = { key: null, canvas: null }
+
+const traceBoundary = (tex, key, W, H, ipx) => {
     const tw = tex.width, th = tex.height
+    const id = `${key}@${getMaskTextureVersion(key)}:${tw}x${th}:${W}x${H}:${ipx.toFixed(3)}`
+    if (boundaryCache.key === id) return boundaryCache.canvas
+
     const sil = document.createElement('canvas'); sil.width = tw; sil.height = th
     const sc = sil.getContext('2d', { willReadFrequently: true })
     sc.drawImage(tex, 0, 0)
-    const id = sc.getImageData(0, 0, tw, th); const d = id.data
+    const img = sc.getImageData(0, 0, tw, th); const d = img.data
     for (let i = 0; i < d.length; i += 4) {
         const cov = d[i + 3] >= 250 ? d[i] : d[i + 3] // luma (opaque) or painted alpha
         const on = cov >= 128 ? 255 : 0
         d[i] = 0x53; d[i + 1] = 0xd8; d[i + 2] = 0xff; d[i + 3] = on
     }
-    sc.putImageData(id, 0, 0)
+    sc.putImageData(img, 0, 0)
     const out = document.createElement('canvas'); out.width = tw; out.height = th
     const oc = out.getContext('2d')
     const r = Math.max(1.2, 2.2 * ipx * (tw / (W || tw))) // ≈ constant on-screen width
     for (let a = 0; a < Math.PI * 2 - 1e-3; a += Math.PI / 8) oc.drawImage(sil, Math.cos(a) * r, Math.sin(a) * r)
     oc.globalCompositeOperation = 'destination-out'
     oc.drawImage(sil, 0, 0)
-    g.drawImage(out, 0, 0, W, H)
+
+    boundaryCache.key = id
+    boundaryCache.canvas = out
+    return out
 }
 
-// SAM output → white-on-black mask canvas. post_process_masks gives an array of
-// Tensors ([nMasks,H,W] at the original image size); pick the highest-IoU mask.
-const samMaskToCanvas = (m, iou) => {
-    const dims = m.dims
-    const w = dims[dims.length - 1], h = dims[dims.length - 2]
-    const nMasks = dims.length >= 3 ? dims[dims.length - 3] : 1
-    const scores = iou && iou.data ? Array.from(iou.data) : []
-    let bi = 0, best = -Infinity
-    for (let i = 0; i < nMasks; i += 1) { const s = scores[i] ?? 0; if (s > best) { best = s; bi = i } }
-    const plane = w * h, off = bi * plane
-    const cv = document.createElement('canvas'); cv.width = w; cv.height = h
-    const ctx = cv.getContext('2d'); const img = ctx.createImageData(w, h)
-    const d = m.data
-    for (let p = 0; p < plane; p += 1) { const v = d[off + p] ? 255 : 0; const q = p * 4; img.data[q] = v; img.data[q + 1] = v; img.data[q + 2] = v; img.data[q + 3] = 255 }
-    ctx.putImageData(img, 0, 0)
-    return cv
+const drawMaskBoundary = (g, tex, key, W, H, ipx) => {
+    if (!tex || !tex.width) return
+    g.drawImage(traceBoundary(tex, key, W, H, ipx), 0, 0, W, H)
 }
 
-// ── optional bridge to the local Python mask service (SAM 3.1) ───────────────
-// The testbed is on-device by default; when the mask service (services/segment)
-// is reachable it is PREFERRED for subject/concept masks (server-side SAM 3.1,
-// far better on stylized art) and for click-select. Every call fails soft, so
-// the on-device engines remain the fallback. The service must allow this origin
-// via CORS_ORIGINS (see services/segment/.env).
-const SERVICE_URL = () => (typeof window !== 'undefined' && window.__MASK_SERVICE_URL) || 'http://127.0.0.1:8001'
-const SUBJECT_CONCEPT = 'main subject' // default prompt the AI Subject button sends
+// Human-readable byte counter for the model-download progress line.
+const mb = (n) => `${(n / (1024 * 1024)).toFixed(0)} MB`
 
-const canvasToBlob = (canvas) =>
-    new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('toBlob failed'))), 'image/png'))
-
-// SAM resizes inputs to ~1024px internally, so uploading the full working
-// canvas (≤MAX_DIM) just wastes PNG-encode + network + server-side decode. Send
-// the service a ≤SAM_INPUT copy instead; the returned mask is scaled back to the
-// requested display size by pngToMaskCanvas, so there's no visible quality loss.
-// Returns the scaled canvas and the scale factor (needed to scale box prompts).
-const SAM_INPUT = 1024
-const downscaleForSam = (canvas, maxDim = SAM_INPUT) => {
-    const scale = Math.min(1, maxDim / Math.max(canvas.width, canvas.height))
-    if (scale === 1) return { canvas, scale: 1 }
-    const c = document.createElement('canvas')
-    c.width = Math.round(canvas.width * scale)
-    c.height = Math.round(canvas.height * scale)
-    c.getContext('2d').drawImage(canvas, 0, 0, c.width, c.height)
-    return { canvas: c, scale }
-}
-
-// Service masks come back as a greyscale PNG (white = subject) or, for /segment,
-// an RGBA cutout carrying the mask in alpha. Decode either into the opaque
-// R=G=B=coverage / A=255 canvas the semantic shader samples.
-const pngToMaskCanvas = (src, w, h) =>
-    new Promise((resolve, reject) => {
-        const img = new Image()
-        img.onload = () => {
-            const cv = document.createElement('canvas')
-            cv.width = w || img.naturalWidth
-            cv.height = h || img.naturalHeight
-            const ctx = cv.getContext('2d', { willReadFrequently: true })
-            ctx.drawImage(img, 0, 0, cv.width, cv.height)
-            const id = ctx.getImageData(0, 0, cv.width, cv.height)
-            const d = id.data
-            for (let i = 0; i < d.length; i += 4) {
-                const v = d[i + 3] < 250 ? d[i + 3] : d[i]
-                d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255
-            }
-            ctx.putImageData(id, 0, 0)
-            resolve(cv)
-        }
-        img.onerror = () => reject(new Error('mask decode failed'))
-        img.src = src
-    })
-
-// GET /health — is the service up, and is SAM 3.1 actually loaded (vs fallback)?
-const checkService = async (timeoutMs = 1500) => {
-    const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
-    try {
-        const r = await fetch(SERVICE_URL() + '/health', { signal: ctrl.signal })
-        if (!r.ok) return { available: false }
-        const j = await r.json()
-        return {
-            available: true,
-            sam3: !!j.sam3_available,
-            sam3Loaded: !!j.sam3_loaded,
-            subjectEngine: j.subject_engine || (j.sam3_available ? 'sam3' : 'saliency'),
-            model: j.sam3_model || j.model || '',
-        }
-    } catch { return { available: false } }
-    finally { clearTimeout(timer) }
-}
-
-// Tight [x0,y0,x1,y1] bounding box of a mask canvas's coverage (white = selected,
-// opaque → coverage in the red channel), in the canvas's own pixel space. Returns
-// null when the mask is essentially empty.
-const bboxOfMaskCanvas = (canvas, thresh = 24) => {
-    const w = canvas.width, h = canvas.height
-    if (!w || !h) return null
-    const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data
-    let x0 = w, y0 = h, x1 = -1, y1 = -1
-    for (let y = 0; y < h; y += 1) {
-        for (let x = 0; x < w; x += 1) {
-            if (d[(y * w + x) * 4] > thresh) {
-                if (x < x0) x0 = x
-                if (x > x1) x1 = x
-                if (y < y0) y0 = y
-                if (y > y1) y1 = y
-            }
-        }
-    }
-    return x1 < 0 ? null : [x0, y0, x1, y1]
-}
-
-// POST /segment/instances — SAM 3.1 concept segmentation; returns the UNION of
-// all matching instances as a white-on-black mask canvas (+ count/mode/model).
-const serviceSubjectMask = async (srcCanvas, { concept = SUBJECT_CONCEPT, width, height } = {}) => {
-    const { canvas: small } = downscaleForSam(srcCanvas)
-    const blob = await canvasToBlob(small)
-    const form = new FormData()
-    form.append('image', blob, 'image.png')
-    form.append('prompt', concept)
-    // Ask the service for its fast subject path: skip the always-failing text
-    // grounding for the abstract "main subject" concept and box-seed SAM 3.1 from
-    // the saliency matte in ONE image encode. Older services ignore this field
-    // and return saliency, in which case runSubject box-seeds client-side.
-    form.append('subject_box', 'true')
-    const r = await fetch(SERVICE_URL() + '/segment/instances', { method: 'POST', body: form })
-    if (!r.ok) throw new Error('service ' + r.status)
-    const j = await r.json()
-    if (!j.union_png) throw new Error(j.count === 0 ? 'no subject found' : 'no mask')
-    const canvas = await pngToMaskCanvas('data:image/png;base64,' + j.union_png, width || j.width, height || j.height)
-    return { canvas, count: j.count || 0, mode: j.mode || 'sam3', model: j.model || '' }
-}
-
-// POST /segment/box — SAM 3.1 box-prompted object select (greyscale PNG mask).
-const serviceSamBox = async (srcCanvas, box, { width, height } = {}) => {
-    // Box is in working-canvas space; scale it to match the downscaled upload.
-    const { canvas: small, scale } = downscaleForSam(srcCanvas)
-    const blob = await canvasToBlob(small)
-    const form = new FormData()
-    form.append('image', blob, 'image.png')
-    form.append('box', JSON.stringify(box.map((v) => Math.round(v * scale))))
-    const r = await fetch(SERVICE_URL() + '/segment/box', { method: 'POST', body: form })
-    if (!r.ok) throw new Error('service ' + r.status)
-    const blobOut = await r.blob()
-    const url = URL.createObjectURL(blobOut)
-    try { return await pngToMaskCanvas(url, width, height) }
-    finally { URL.revokeObjectURL(url) }
-}
-
-// POST /sam2/click — SAM point-prompted click-select (service).
-const serviceSamClick = async (srcCanvas, points, labels, { width, height } = {}) => {
-    const { canvas: small, scale } = downscaleForSam(srcCanvas)
-    const blob = await canvasToBlob(small)
-    const form = new FormData()
-    form.append('image', blob, 'image.png')
-    form.append('points', JSON.stringify(points.map(([x, y]) => [Math.round(x * scale), Math.round(y * scale)])))
-    form.append('labels', JSON.stringify(labels))
-    const r = await fetch(SERVICE_URL() + '/sam2/click', { method: 'POST', body: form })
-    if (!r.ok) throw new Error('service ' + r.status)
-    const blobOut = await r.blob()
-    const url = URL.createObjectURL(blobOut)
-    try { return await pngToMaskCanvas(url, width, height) }
-    finally { URL.revokeObjectURL(url) }
-}
-
-// POST /ground/text — SAM 3.1 open-vocabulary TEXT grounding (binds the phrase
-// to a region). Returns results[0].maskPng (base64 greyscale, white = selected).
-const serviceGroundText = async (srcCanvas, phrase, { width, height } = {}) => {
-    const { canvas: small } = downscaleForSam(srcCanvas)
-    const blob = await canvasToBlob(small)
-    const form = new FormData()
-    form.append('image', blob, 'image.png')
-    form.append('phrases', JSON.stringify([phrase]))
-    const r = await fetch(SERVICE_URL() + '/ground/text', { method: 'POST', body: form })
-    if (!r.ok) throw new Error('service ' + r.status)
-    const j = await r.json()
-    const res = Array.isArray(j.results) ? j.results[0] : null
-    if (!res || !res.found || !res.maskPng) throw new Error(`no region matched “${phrase}”`)
-    const canvas = await pngToMaskCanvas('data:image/png;base64,' + res.maskPng, width || j.width, height || j.height)
-    return { canvas, engine: j.engine || 'clipseg', score: res.score, coverage: res.coverage }
+// Radial / linear / path geometry is image-space px, so exporting at a larger
+// resolution has to scale it. Texture-backed masks need nothing — the shader
+// samples them in normalised UV, so a ≤proxy mask upsamples with its own soft
+// coverage intact.
+const scaleLayer = (l, k) => {
+    if (!l || k === 1) return l
+    const pt = (p) => (p ? { x: p.x * k, y: p.y * k } : p)
+    const out = { ...l }
+    if (out.center) out.center = pt(out.center)
+    if (out.radius) out.radius = { x: out.radius.x * k, y: out.radius.y * k }
+    if (out.p1) out.p1 = pt(out.p1)
+    if (out.p2) out.p2 = pt(out.p2)
+    if (Array.isArray(out.points)) out.points = out.points.map(pt)
+    return out
 }
 
 function App() {
@@ -335,33 +208,44 @@ function App() {
     const [tick, setTick] = useState(0)
     const [hasImage, setHasImage] = useState(false)
     const [status, setStatus] = useState('')
-    // on-device AI (client-ai.js, loaded lazily so transformers.js stays a chunk)
-    const [ai, setAi] = useState({ busy: false, status: '', device: null, report: null, service: { status: 'unchecked' }, sensitivity: 0.5, fillHoles: true, lastFragmented: false })
+    // On-device segmentation engine (ai/studio-bridge.js → seglab SAM 2.1 lane).
+    const [ai, setAi] = useState({ busy: false, status: '', engine: null, progress: null, pressure: 0 })
     const [aiPhrase, setAiPhrase] = useState('')
-    const aiModRef = useRef(null)
-    const samRef = useRef(null)     // cached on-device SAM fallback { model, processor, image, src }
+    const [aiLasso, setAiLasso] = useState(null)   // in-progress AI-lasso stroke (image px)
 
     const bump = () => setTick((t) => t + 1)
     const W = imageSize?.width || 0
     const H = imageSize?.height || 0
+    const aiSet = useCallback((patch) => setAi((s) => ({ ...s, ...patch })), [])
+    // Texture-backed layer count, in a ref so the governor's measure callback
+    // can read it without re-subscribing on every chain change.
+    const textureLayers = useRef(0)
 
-    /* ── image loading ─────────────────────────────────────────────────── */
-    const loadImage = useCallback((url, label) => {
-        // Downscale the decoded source into the ≤MAX_DIM working canvas.
-        const buildWorkingCanvas = (bitmapOrImg, naturalW, naturalH) => {
-            const scale = Math.min(1, MAX_DIM / Math.max(naturalW, naturalH))
-            const w = Math.round(naturalW * scale)
-            const h = Math.round(naturalH * scale)
-            const c = document.createElement('canvas')
-            c.width = w; c.height = h
-            c.getContext('2d', { willReadFrequently: true }).drawImage(bitmapOrImg, 0, 0, w, h)
-            if (bitmapOrImg.close) bitmapOrImg.close()
-            return { c, w, h }
-        }
+    /* ── image import (seglab asset-store: blob-only custody + bounded proxy) ─ */
+    // One canvas for the life of the page: importOriginal resizes it in place,
+    // so the megashader source, the mask textures and the model's interaction
+    // frame are the same buffer and no mask ever needs a resample.
+    const proxyCanvas = useRef(null)
+    if (!proxyCanvas.current && typeof document !== 'undefined') {
+        proxyCanvas.current = document.createElement('canvas')
+    }
 
-        const onReady = ({ c, w, h }) => {
-            srcRef.current = c
+    const loadImage = useCallback(async (source, label) => {
+        const canvas = proxyCanvas.current
+        try {
+            setStatus('Reading image…')
+            const mod = await engine()
+            const transform = await mod.importImage(source, {
+                proxyCanvas: canvas,
+                onStage: (msg) => setStatus(msg),
+            })
+            if (!transform) return  // a newer import owns the canvas now
+            const w = canvas.width
+            const h = canvas.height
+
+            srcRef.current = canvas
             brushRef.current = null
+            refineRef.current = null
             // Base/global grade carrier: a full-WHITE texture so one semantic
             // layer covers EVERY pixel (white = full coverage — no smoothstep
             // boundary, unlike a luminance(0..1) mask which under-covers pure
@@ -371,44 +255,56 @@ function App() {
             const wx = wc.getContext('2d'); wx.fillStyle = '#fff'; wx.fillRect(0, 0, w, h)
             setMaskTexture(baseKey, wc)
             setBaseLayer(sanitiseLayer({ ...semanticLayer({ maskTextureKey: baseKey, feather: 0, label: 'Base' }), id: 'base', fillMode: 'adjust' }))
-            setHistogram(computeImageHistogram({ getElement: () => c }))
+            setHistogram(computeImageHistogram({ getElement: () => canvas }))
             setImageSize({ width: w, height: h })
             setChain([]); setSelectedId(null); setTool(null); setDraft([])
+            setClickPoints([]); setClickMaskId(null); setSamBox(null); setAiLasso(null)
             setHasImage(true)
-            setStatus(`${label || 'image'} · ${w}×${h}`)
+            const native = `${transform.originalW}×${transform.originalH}`
+            setStatus(`${label || 'image'} · ${native} → ${w}×${h} interaction frame${transform.sourceWasRaw ? ' (RAW preview)' : ''}`)
             bump()
-        }
-
-        // Classic decode path — fallback for environments without
-        // createImageBitmap and for any fetch failure.
-        const loadViaImage = () => {
-            const image = new Image()
-            image.crossOrigin = 'anonymous'
-            image.onload = () => onReady(buildWorkingCanvas(image, image.naturalWidth, image.naturalHeight))
-            image.onerror = () => setStatus('image failed to load')
-            image.src = url
-        }
-
-        if (typeof createImageBitmap === 'function') {
-            // fetch → blob → createImageBitmap decodes off the main thread, so a
-            // 4K/8K original doesn't block the UI during load.
-            fetch(url)
-                .then((r) => { if (!r.ok) throw new Error('fetch ' + r.status); return r.blob() })
-                .then((blob) => createImageBitmap(blob))
-                .then((bmp) => onReady(buildWorkingCanvas(bmp, bmp.width, bmp.height)))
-                .catch(loadViaImage)
-        } else {
-            loadViaImage()
+        } catch (err) {
+            console.error('[studio] import failed', err)
+            setStatus('Import failed: ' + (err?.message || err))
         }
     }, [])
 
     // Auto-load the bundled sample so the page is usable (and testable) instantly.
-    useEffect(() => { loadImage('test.png?' + Date.now(), 'sample') }, [loadImage])
+    useEffect(() => {
+        fetch('test.png')
+            .then((r) => (r.ok ? r.blob() : Promise.reject(new Error('no sample'))))
+            .then((blob) => loadImage(blob, 'sample'))
+            .catch(() => setStatus('Load an image to begin'))
+    }, [loadImage])
 
     const onFile = (e) => {
         const f = e.target.files?.[0]
-        if (f) loadImage(URL.createObjectURL(f), f.name)
+        if (f) loadImage(f, f.name)
+        e.target.value = ''  // re-selecting the same file must re-import
     }
+
+    // Drop / paste an image (or a camera RAW) anywhere on the page.
+    useEffect(() => {
+        const onDrop = (e) => {
+            e.preventDefault()
+            const f = e.dataTransfer?.files?.[0]
+            if (f) loadImage(f, f.name)
+        }
+        const onPaste = (e) => {
+            const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'))
+            const f = item?.getAsFile()
+            if (f) loadImage(f, f.name || 'pasted image')
+        }
+        const stop = (e) => e.preventDefault()
+        window.addEventListener('dragover', stop)
+        window.addEventListener('drop', onDrop)
+        window.addEventListener('paste', onPaste)
+        return () => {
+            window.removeEventListener('dragover', stop)
+            window.removeEventListener('drop', onDrop)
+            window.removeEventListener('paste', onPaste)
+        }
+    }, [loadImage])
 
     /* ── chain mutations ───────────────────────────────────────────────── */
     const commit = useCallback((layer, { select = true } = {}) => {
@@ -573,6 +469,9 @@ function App() {
         if (tool === 'color') { sampleColor(p); setTool(null); setStatus(''); return }
         if (tool === 'clickselect') {
             e.preventDefault()
+            // Drop clicks while a selection is in flight rather than dropping a
+            // marker the run behind it will never honour.
+            if (ai.busy) return
             const label = e.altKey ? 0 : 1  // Alt+click = negative point
             const newPts = [...clickPoints, { x: p.x, y: p.y, label }]
             setClickPoints(newPts)
@@ -583,6 +482,13 @@ function App() {
             e.preventDefault(); overlayRef.current.setPointerCapture?.(e.pointerId)
             dragRef.current = { kind: 'sambox', start: p }
             setSamBox({ x0: p.x, y0: p.y, x1: p.x, y1: p.y }); return
+        }
+        if (tool === 'ailasso') {
+            e.preventDefault(); overlayRef.current.setPointerCapture?.(e.pointerId)
+            // Sampled, not accumulated per event: a dense stroke costs the same
+            // prompt (bbox + centroid) and a much cheaper clamp raster.
+            dragRef.current = { kind: 'ailasso', pts: [p] }
+            setAiLasso([p]); return
         }
         // 2 · otherwise: direct-manipulate the SELECTED spatial mask via handles
         const sel = chain.find((c) => c.layer.id === selectedId)?.layer
@@ -615,6 +521,13 @@ function App() {
         const id = selectedId
         if (d.kind === 'paint') { stampLineInto(d.target.ctx, d.last, p, d.erase, d.target.mode); d.last = p; scheduleBrushSync(d.target); return }
         if (d.kind === 'sambox') { setSamBox({ x0: d.start.x, y0: d.start.y, x1: p.x, y1: p.y }); return }
+        if (d.kind === 'ailasso') {
+            const last = d.pts[d.pts.length - 1]
+            if (dist(last, p) < Math.max(W, H) * 0.004) return
+            d.pts.push(p)
+            setAiLasso(d.pts.slice())
+            return
+        }
         if (d.kind === 'radial-move') {
             updateLayer(id, { center: { x: p.x + d.offset.x, y: p.y + d.offset.y } })
         } else if (d.kind === 'radial-resize') {
@@ -648,6 +561,13 @@ function App() {
             setSamBox(null)
             if (x1 - x0 >= 6 && y1 - y0 >= 6) onSamBox([x0, y0, x1, y1])
             else setStatus('Box too small — drag a larger rectangle around the object')
+            return
+        }
+        if (d?.kind === 'ailasso') {
+            const pts = d.pts
+            setAiLasso(null)
+            if (pts.length >= 3) onAiLasso(pts)
+            else setStatus('Loop too short — draw around the object')
             return
         }
         if (d?.kind === 'paint' && d.target) {
@@ -817,349 +737,270 @@ function App() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
-    /* ── on-device AI masks (reuse phosmith's in-browser engines) ───────── */
-    // All inference is in-browser (WebGPU→WASM); nothing is sent to a server.
-    const loadAi = async () => {
-        if (!aiModRef.current) {
-            // CRITICAL: point onnxruntime-web at the LOCAL, version-matched
-            // runtime files. Bundlers (bun/esbuild) break onnxruntime's runtime
-            // fetch of ort-wasm-simd-threaded.jsep.{mjs,wasm} — the JSEP glue that
-            // defines `webgpuInit` — so WebGPU init throws "webgpuInit is not a
-            // function" and WASM reports "no available backend found". Serving the
-            // exact dist files from /ort/ and setting wasmPaths makes BOTH backends
-            // load deterministically. Single-threaded (no cross-origin isolation
-            // here → no SharedArrayBuffer for multi-threaded WASM).
-            const tf = await import('@huggingface/transformers')
-            tf.env.backends.onnx.wasm.wasmPaths = new URL('ort/', document.baseURI).href
-            tf.env.backends.onnx.wasm.numThreads = 1
-            aiModRef.current = await import('@/lib/client-ai')
-        }
-        return aiModRef.current
-    }
-    const aiSet = (patch) => setAi((s) => ({ ...s, ...patch }))
+    /* ── on-device AI masks (seglab SAM 2.1 lane via ai/studio-bridge.js) ─── */
+    // Every model runs in this browser on WebGPU. Nothing is uploaded, there is
+    // no service to probe and no fallback engine to pick between: one lane, so
+    // the app can always say which model produced a mask.
 
-    // Probe the local mask service once on load so the AI tools can PREFER
-    // SAM 3.1 when it's up and fall back on-device when it isn't. Fails soft.
+    // Boot the engine once: probe the device, size the budget, start the memory
+    // governor, then warm the lane speculatively behind the first import.
     useEffect(() => {
         let alive = true
+        let offEvent = null
         ;(async () => {
-            aiSet({ service: { status: 'checking' } })
-            const s = await checkService()
-            if (alive) aiSet({ service: { status: s.available ? 'available' : 'offline', sam3: s.sam3, sam3Loaded: s.sam3Loaded, model: s.model, subjectEngine: s.subjectEngine } })
-        })()
-        return () => { alive = false }
-    }, [])
-
-    // Return the live mask-service info, RE-PROBING when we don't already know
-    // it's up — so SAM 3.1 drives subject / concept / click-select even when the
-    // Python service is started AFTER this page loaded (no reload needed). The
-    // server SAM 3.1 path is preferred for almost everything; the on-device
-    // engines are the fallback. A localhost probe rejects instantly when the
-    // service is down, so this adds no real latency to the fallback path.
-    const ensureService = useCallback(async () => {
-        if (ai.service?.status === 'available') return ai.service
-        const s = await checkService()
-        const info = s.available
-            ? { status: 'available', sam3: s.sam3, sam3Loaded: s.sam3Loaded, model: s.model, subjectEngine: s.subjectEngine }
-            : { status: 'offline' }
-        aiSet({ service: info })
-        return info
-    }, [ai.service])
-
-    // AI Subject — prefer the SAM 3.1 mask service (concept segmentation of the
-    // whole subject) when it's up; otherwise on-device RMBG-1.4 + matte cleanup
-    // (binarize / close / fill-holes / keep-significant + luminance assist),
-    // which rescues the holes RMBG leaves on stylized / backlit silhouettes.
-    const runSubject = useCallback(async (conceptArg, { invert = false, label: labelArg } = {}) => {
-        if (!srcRef.current) return
-        const concept = (typeof conceptArg === 'string' && conceptArg.trim()) || SUBJECT_CONCEPT
-        // invert=true → mask the subject, then flip it to select the ENTIRE
-        // background/sky. Text grounding ("sky") only binds CLIPSeg to the bright
-        // sky blob (~40% here); detect-subject-and-invert covers everything that
-        // ISN'T the subject — the only reliable "whole sky/background" selection.
-        const label = labelArg || (invert ? 'AI Sky / Background' : 'AI Subject')
-        const noun = invert ? 'Background' : 'Subject'
-        const svc = await ensureService()
-        if (svc.status === 'available') {
-            aiSet({ busy: true, status: `${noun}: segmenting “${concept}” via mask service…` })
             try {
-                let { canvas, mode, model } = await serviceSubjectMask(srcRef.current, { concept, width: W, height: H })
-                // SAM 3.1's open-vocab detector only grounds CONCRETE nouns, not
-                // the abstract concept "main subject" — so /segment/instances
-                // returns the saliency matte (mode != 'sam3') for the generic
-                // subject prompt. Seed SAM 3.1 with that matte's bounding box (a
-                // box prompt — the strongest single-object prompt) to upgrade it
-                // to a crisp SAM 3.1 mask of the same subject.
-                if (mode !== 'sam3') {
-                    const box = bboxOfMaskCanvas(canvas)
-                    if (box && (box[2] - box[0]) >= 8 && (box[3] - box[1]) >= 8) {
-                        aiSet({ busy: true, status: `${noun}: refining with SAM 3.1 (box-seeded from saliency)…` })
-                        try {
-                            const samCanvas = await serviceSamBox(srcRef.current, box, { width: W, height: H })
-                            if (samCanvas && bboxOfMaskCanvas(samCanvas)) { canvas = samCanvas; mode = 'sam3'; model = model || 'sam3.1' }
-                        } catch { /* SAM 3.1 box failed — keep the saliency matte */ }
+                const mod = await engine()
+                offEvent = mod.onEngineEvent((event) => {
+                    if (!alive) return
+                    if (event.type === 'progress') {
+                        const d = event.detail || {}
+                        if (!d.total) return
+                        aiSet({ progress: { file: d.file || d.lane || 'model', loaded: d.loaded || 0, total: d.total } })
+                        if ((d.loaded || 0) >= d.total) setTimeout(() => alive && aiSet({ progress: null }), 400)
+                    } else if (event.type === 'pressure') {
+                        aiSet({ pressure: event.level, status: event.level >= 3
+                            ? 'Memory pressure — running in safe mode.'
+                            : 'Memory pressure — heavy caches released.' })
+                    } else if (event.type === 'waiting') {
+                        aiSet({ status: 'Waiting for the segmentation lane…' })
+                    } else {
+                        aiSet({ engine: mod.status() })
                     }
-                }
-                const keys = registerTexture(canvas)
-                commit({ ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather: 0.02, label }), baseTextureKey: keys.baseTextureKey, growPx: 0, inverted: invert, ...newFillProps('semantic') })
-                const sam3 = mode === 'sam3'
-                aiSet({ busy: false, device: sam3 ? 'sam3.1' : 'service', lastFragmented: false, status: sam3 ? `${noun} masked — SAM 3.1 (${model || 'sam3.1'})${invert ? ' → inverted = entire sky/background' : ''}` : `${noun} masked — service fallback (${mode})${invert ? ' → inverted = entire sky/background' : '; install SAM 3.1 for best results'}` })
-                return
-            } catch (e) {
-                aiSet({ status: `Service subject failed (${e?.message || e}) — falling back on-device…` })
+                })
+                await mod.boot({
+                    // The governor's ledger is the only memory signal that exists
+                    // on WebKit, so every buffer React owns has to be in it —
+                    // including the mask textures, which are the term that grows
+                    // with use (each texture-backed layer holds a live canvas
+                    // plus its pristine boundary base, both at frame size).
+                    measure: () => {
+                        const px = (c) => (c ? c.width * c.height * 4 : 0)
+                        const frame = px(srcRef.current)
+                        return {
+                            pixelBytes: frame + px(overlayRef.current) + px(dispRef.current)
+                                + textureLayers.current * frame * 2,
+                        }
+                    },
+                })
+                if (!alive) return
+                aiSet({ engine: mod.status() })
+                await mod.warm({ withEncoder: false })
+                if (alive) aiSet({ engine: mod.status() })
+            } catch (err) {
+                console.error('[studio] engine boot failed', err)
+                if (alive) aiSet({ status: 'Engine unavailable: ' + (err?.message || err) })
             }
+        })()
+        return () => { alive = false; offEvent?.() }
+    }, [aiSet])
+
+    // Register a lane mask as a new semantic layer. `res` is what the bridge
+    // returns; its canvas is already the opaque R=G=B=coverage texture the
+    // semantic shader samples, at exactly the working canvas's dimensions.
+    const commitAiMask = useCallback((res, { label, invert = false, feather = 0.02 } = {}) => {
+        const keys = registerTexture(res.canvas)
+        return commit({
+            ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather, label }),
+            baseTextureKey: keys.baseTextureKey,
+            growPx: 0,
+            inverted: invert,
+            ...newFillProps('semantic'),
+        })
+    }, [commit])
+
+    // One place where every AI tool's async lifecycle lives: busy latch, stale
+    // guard, engine-status refresh and error surface. Tools describe the run;
+    // they never re-implement it.
+    const runAi = useCallback(async (startStatus, work) => {
+        if (ai.busy || !srcRef.current) return null
+        aiSet({ busy: true, status: startStatus })
+        try {
+            const mod = await engine()
+            const res = await work(mod, srcRef.current)
+            if (!res || res.stale) { aiSet({ busy: false, status: '' }); return null }
+            if (!res.usable) { aiSet({ busy: false, status: res.reason || 'Nothing selectable there — try another prompt' }); return null }
+            aiSet({ busy: false, engine: mod.status(), status: '' })
+            return res
+        } catch (err) {
+            console.error('[studio] ai run failed', err)
+            aiSet({ busy: false, status: (err?.message || String(err)) })
+            return null
         }
-        aiSet({ busy: true, status: `AI ${noun}: loading background-removal model (first run ~44 MB)…` })
-        try {
-            const mod = await loadAi()
-            const raw = await mod.clientSubjectMask(srcRef.current, { width: W, height: H })
-            const { canvas, diagnostics } = cleanSubjectMatte(raw, {
-                threshold: Math.max(0.05, Math.min(0.95, 1 - (ai.sensitivity ?? 0.5))),
-                fillHoles: ai.fillHoles !== false,
-                luminanceAssist: true,
-                sourceCanvas: srcRef.current,
-            })
-            const keys = registerTexture(canvas)
-            commit({ ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather: 0.02, label }), baseTextureKey: keys.baseTextureKey, growPx: 0, inverted: invert, ...newFillProps('semantic') })
-            const st = mod.getClientAIState()
-            const tip = diagnostics.fragmented ? ' — matte looked fragmented; AI Box-Select usually nails stylized subjects' : ''
-            aiSet({ busy: false, device: st.device, lastFragmented: diagnostics.fragmented, status: `${noun} masked on ${st.device || 'device'} (cleaned)${invert ? ' → inverted = entire sky/background' : ''}${tip}` })
-        } catch (e) { aiSet({ busy: false, status: `${noun} failed: ` + (e?.message || e) }) }
-    }, [W, H, commit, ensureService, ai.sensitivity, ai.fillHoles])
+    }, [ai.busy, aiSet])
 
-    const runDepth = useCallback(async () => {
-        if (!srcRef.current) return
-        aiSet({ busy: true, status: 'Depth: loading Depth-Anything (first run downloads ~50 MB)…' })
-        try {
-            const mod = await loadAi()
-            const canvas = await mod.clientDepthMap(srcRef.current, { width: W, height: H })
-            const key = 'ai-depth-' + uid()
-            setMaskTexture(key, canvas)
-            // default to the NEAR half of the depth range (white = near)
-            commit({ ...depthLayer({ depthMapKey: key, min: 0.5, max: 1, softness: 0.15, label: 'AI Depth (near)' }), ...newFillProps('depth') })
-            const st = mod.getClientAIState()
-            aiSet({ busy: false, status: `Depth map ready on ${st.device || 'device'}`, device: st.device })
-        } catch (e) { aiSet({ busy: false, status: 'Depth failed: ' + (e?.message || e) }) }
-    }, [W, H, commit])
+    // AI Subject / AI Sky·Background — the same mask, inverted for the second.
+    // See studio-bridge.selectSubject for why this is three decoder probes over
+    // one cached encode rather than a saliency model.
+    const runSubject = useCallback(async ({ invert = false } = {}) => {
+        const noun = invert ? 'Background' : 'Subject'
+        const res = await runAi(`AI ${noun}: segmenting…`, (mod, canvas) => mod.selectSubject(canvas))
+        if (!res) return
+        commitAiMask(res, { label: invert ? 'AI Sky / Background' : 'AI Subject', invert })
+        aiSet({ status: `${noun} masked — SAM 2.1 (${res.probe}, ${(res.coverage * 100).toFixed(0)}% coverage, ${res.ms} ms)${invert ? ' → inverted = the entire sky / background' : ''}` })
+    }, [runAi, commitAiMask, aiSet])
 
+    // AI Text — open-vocabulary, on-device: the detector localises the phrase,
+    // then SAM segments every box it returns and the masks union into one layer.
     const runText = useCallback(async (phrase) => {
-        if (!srcRef.current || !phrase) return
-        // "sky"/"horizon" are real visual concepts SAM 3.1 grounds directly and
-        // completely (≈80% at the 0.25 confidence default), so they go through
-        // /ground/text below. Abstract "background"/"backdrop" aren't SAM
-        // concepts — segment the subject and invert (its COMPLEMENT) instead.
-        if (/\b(background|backdrop|backg(?:round)?|scenery|behind)\b/i.test(phrase.trim())) {
-            return runSubject(phrase, { invert: true, label: `AI: ${phrase}` })
-        }
-        // Use the service's TEXT-grounding endpoint (/ground/text → SAM 3 when
-        // loaded, else CLIPSeg). NOT /segment/instances: that's concept seg that
-        // falls back to a saliency SUBJECT mask when SAM 3.1 is absent, so every
-        // phrase returns the same salient object regardless of the words (the
-        // "search returns the subject for everything" bug).
-        const svc = await ensureService()
-        if (svc.status === 'available') {
-            aiSet({ busy: true, status: `Grounding “${phrase}” via mask service…` })
-            try {
-                const { canvas, engine, score } = await serviceGroundText(srcRef.current, phrase, { width: W, height: H })
-                const keys = registerTexture(canvas)
-                commit({ ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather: 0.03, label: `AI: ${phrase}` }), baseTextureKey: keys.baseTextureKey, growPx: 0, ...newFillProps('semantic') })
-                aiSet({ busy: false, device: engine === 'sam3' ? 'sam3.1' : 'clipseg', status: `“${phrase}” matched (${engine}${typeof score === 'number' ? `, score ${score.toFixed(2)}` : ''})` })
-                return
-            } catch (e) {
-                aiSet({ status: `Service grounding failed (${e?.message || e}) — trying on-device CLIPSeg…` })
-            }
-        }
-        aiSet({ busy: true, status: `Text: grounding “${phrase}” (first run downloads CLIPSeg ≈600 MB)…` })
-        try {
-            const mod = await loadAi()
-            const { canvas, score } = await mod.clientGroundPhrase(srcRef.current, phrase, { width: W, height: H })
-            if (!canvas) throw new Error('no region matched')
-            const keys = registerTexture(canvas)
-            commit({ ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather: 0.03, label: `AI: ${phrase}` }), baseTextureKey: keys.baseTextureKey, growPx: 0, ...newFillProps('semantic') })
-            const st = mod.getClientAIState()
-            aiSet({ busy: false, status: `“${phrase}” matched (score ${score?.toFixed?.(2) ?? '?'}) on ${st.device || 'device'}`, device: st.device })
-        } catch (e) { aiSet({ busy: false, status: 'Text grounding failed: ' + (e?.message || e) }) }
-    }, [W, H, commit, ensureService, runSubject])
+        const q = (phrase || '').trim()
+        if (!q) return
+        const res = await runAi(`Searching this photo for “${q}” (the first search loads the detector)…`,
+            (mod, canvas) => mod.selectText(canvas, q))
+        if (!res) return
+        commitAiMask(res, { label: `AI: ${q}`, feather: 0.03 })
+        aiSet({ status: `“${q}” — ${res.matches} region${res.matches === 1 ? '' : 's'} selected (${res.backend})` })
+    }, [runAi, commitAiMask, aiSet])
 
-    // Lightweight device check: an INSTANT WebGPU/WASM probe, then confirm
-    // end-to-end with ONLY the smallest model (RMBG subject, ~44 MB) on a tiny
-    // synthetic scene — far faster than the 3-model self-test (~250 MB) the user
-    // found slow.
-    const testDevice = useCallback(async () => {
-        aiSet({ busy: true, status: 'Checking device…', report: null })
-        try {
-            let device = 'wasm'
-            try { if (navigator.gpu && (await navigator.gpu.requestAdapter())) device = 'webgpu' } catch { /* no webgpu */ }
-            aiSet({ device, status: `Device supports ${device.toUpperCase()} — confirming with the subject model (one-time ~44 MB download)…` })
-            const mod = await loadAi()
-            const probe = document.createElement('canvas'); probe.width = 256; probe.height = 256
-            const pc = probe.getContext('2d')
-            pc.fillStyle = '#23304a'; pc.fillRect(0, 0, 256, 256)
-            pc.fillStyle = '#d8b552'; pc.beginPath(); pc.arc(128, 152, 60, 0, Math.PI * 2); pc.fill(); pc.fillRect(110, 72, 36, 90)
-            const t0 = Date.now()
-            const out = await mod.clientSubjectMask(probe, { width: 256, height: 256 })
-            const ms = ((Date.now() - t0) / 1000).toFixed(1)
-            const st = mod.getClientAIState()
-            const ok = !!(out && out.width)
-            aiSet({
-                busy: false, device: st.device || device,
-                status: ok ? `On-device AI works — subject model ran in ${ms}s on ${st.device || device}` : 'Model loaded but returned no mask',
-                report: { caps: [['Subject', ok], [String(st.device || device).toUpperCase(), true]] },
-            })
-        } catch (e) { aiSet({ busy: false, status: 'Device AI check failed: ' + (e?.message || e) }) }
-    }, [])
-
-    // On-device SlimSAM — offline fallback when the SAM 3.1 service is down.
-    // Loads once; image encodes per call (SlimSAM is tiny).
-    const ensureSam = async () => {
-        const tf = await import('@huggingface/transformers')
-        tf.env.backends.onnx.wasm.wasmPaths = new URL('ort/', document.baseURI).href
-        tf.env.backends.onnx.wasm.numThreads = 1
-        if (!samRef.current || samRef.current.src !== srcRef.current) {
-            let device = 'wasm'
-            try { if (navigator.gpu && (await navigator.gpu.requestAdapter())) device = 'webgpu' } catch { /* no webgpu */ }
-            const model = samRef.current?.model || await tf.SamModel.from_pretrained('Xenova/slimsam-77-uniform', { device })
-            const processor = samRef.current?.processor || await tf.AutoProcessor.from_pretrained('Xenova/slimsam-77-uniform')
-            const blob = await new Promise((res, rej) => srcRef.current.toBlob((b) => (b ? res(b) : rej(new Error('toBlob failed'))), 'image/png'))
-            const image = await tf.RawImage.fromBlob(blob)
-            // Encode the image ONCE (the slow ViT pass) and cache the embeddings —
-            // every subsequent click reuses them, so multi-point refine is fast.
-            let embeddings = null
-            try { embeddings = await model.get_image_embeddings(await processor(image)) } catch { /* fall back to per-call encode */ }
-            samRef.current = { model, processor, image, embeddings, src: srcRef.current, device }
-        }
-        return samRef.current
-    }
-
-    const runSamBox = async (box) => {
-        const { model, processor, image, embeddings } = await ensureSam()
-        const input_boxes = [[[Math.round(box[0]), Math.round(box[1]), Math.round(box[2]), Math.round(box[3])]]]
-        const inputs = await processor(image, { input_boxes })
-        let outputs
-        if (embeddings) {
-            try { outputs = await model({ ...embeddings, input_boxes: inputs.input_boxes }) } catch { outputs = null }
-        }
-        if (!outputs) outputs = await model(inputs) // fallback: full encode
-        const masks = await processor.post_process_masks(outputs.pred_masks, inputs.original_sizes, inputs.reshaped_input_sizes)
-        return samMaskToCanvas(masks[0], outputs.iou_scores)
-    }
-
-    // On-device SlimSAM point-prompt — click-select fallback.
-    const runSamClick = async (points, labels) => {
-        const { model, processor, image, embeddings } = await ensureSam()
-        const input_points = [[points.map(([x, y]) => [Math.round(x), Math.round(y)])]]
-        const input_labels = [[labels]]
-        const inputs = await processor(image, { input_points, input_labels })
-        let outputs
-        if (embeddings) {
-            try { outputs = await model({ ...embeddings, input_points: inputs.input_points, input_labels: inputs.input_labels }) } catch { outputs = null }
-        }
-        if (!outputs) outputs = await model(inputs)
-        const masks = await processor.post_process_masks(outputs.pred_masks, inputs.original_sizes, inputs.reshaped_input_sizes)
-        return samMaskToCanvas(masks[0], outputs.iou_scores)
-    }
-
-    // Box-select: drag a box around an object → SAM 3.1 (service) returns its
-    // mask. Falls back to on-device SlimSAM when the service is unavailable.
+    // AI Box-Select — drag a box, SAM returns the object inside it.
     const onSamBox = useCallback(async (box) => {
-        if (ai.busy || !srcRef.current) return
-        aiSet({ busy: true, status: 'Box-Select: segmenting…' })
-        try {
-            let canvas = null
-            const svc = await ensureService()
-            if (svc.status === 'available') {
-                try { canvas = await serviceSamBox(srcRef.current, box, { width: W, height: H }) } catch { canvas = null }
-            }
-            let onDevice = false
-            if (!canvas) { canvas = await runSamBox(box); onDevice = true }
-            const keys = registerTexture(canvas)
-            commit({ ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather: 0.02, label: 'AI Box-Select' }), baseTextureKey: keys.baseTextureKey, growPx: 0, ...newFillProps('semantic') })
-            const st = onDevice ? (samRef.current?.device || 'device') : 'SAM 3.1'
-            aiSet({ busy: false, status: `Selected on ${st} — drag another box to select again, or press Done`, device: st })
-        } catch (e) { aiSet({ busy: false, status: 'Box-Select failed: ' + (e?.message || e) }) }
-    }, [ai.busy, W, H, commit, ensureService])
+        const res = await runAi('Box-Select: segmenting…', (mod, canvas) => mod.select(canvas, { box }))
+        if (!res) return
+        commitAiMask(res, { label: 'AI Box-Select' })
+        aiSet({ status: `Selected in ${res.ms} ms — drag another box, or press Done` })
+    }, [runAi, commitAiMask, aiSet])
 
-    // Click-select / predictive refine: each click runs SAM at that point to get
-    // the object under the cursor, then composites it INTO the active mask — a
-    // normal click UNIONS the region in (add), Alt+click SUBTRACTS it (remove).
-    // SAM is always prompted POSITIVELY at the point (to find what's there); the
-    // click's intent (add vs remove) is decided when compositing. This ALTERS the
-    // current selection (e.g. an AI Subject mask) instead of replacing it. With no
-    // mask active, the first click seeds a fresh AI Click-Select layer.
+    // AI Lasso — a rough loop is a PROMPT, not a cut: its bbox and centroid go
+    // to SAM, which snaps to the real object boundary, and the result is then
+    // clamped to the loop ∪ margin so it can never bleed onto a neighbour.
+    const onAiLasso = useCallback(async (poly) => {
+        const res = await runAi('Lasso: snapping to the object…',
+            (mod, canvas) => mod.select(canvas, { lasso: poly.map((p) => [p.x, p.y]) }))
+        if (!res) return
+        commitAiMask(res, { label: 'AI Lasso' })
+        aiSet({ status: `Snapped to the object inside the loop (${res.ms} ms) — draw another, or press Done` })
+    }, [runAi, commitAiMask, aiSet])
+
+    /**
+     * AI Click-Select / predictive refine. Each click segments the object under
+     * the cursor and composites it INTO the active mask — a plain click unions
+     * it in, Alt+click subtracts it. SAM is always prompted POSITIVELY at the
+     * point (to find what is there); the click's intent is applied afterwards by
+     * sam-core's op model, which keeps the refined boundary's soft falloff on an
+     * add and dilates the subtract channel so removing an object leaves no
+     * one-pixel residue ring. With no mask active the first click seeds a fresh
+     * layer instead.
+     */
     const onClickSelect = useCallback(async (pts) => {
-        if (ai.busy || !srcRef.current || !pts.length) return
         const last = pts[pts.length - 1]
-        const add = last.label !== 0   // Alt+click (label 0) = remove the region
-        aiSet({ busy: true, status: add ? 'Click-Select: finding region to add…' : 'Click-Select: finding region to remove…' })
+        if (!last) return
+        const add = last.label !== 0
+        const res = await runAi(add ? 'Click-Select: finding the region to add…' : 'Click-Select: finding the region to remove…',
+            (mod, canvas) => mod.select(canvas, { clicks: [[last.x, last.y, 1]] }))
+        if (!res) return
+        const mod = await engine()
+        const sel = clickMaskId ? chain.find((e) => e.layer.id === clickMaskId) : null
+        if (sel) {
+            const key = sel.layer.maskTextureKey
+            const merged = mod.composeMask(key ? getMaskTexture(key) : null, res.canvas, add ? 'add' : 'sub', W, H)
+            if (key) setMaskTexture(key, merged)
+            // Re-base the boundary grow/shrink origin to the refined edge.
+            if (sel.layer.baseTextureKey) {
+                const snap = document.createElement('canvas'); snap.width = W; snap.height = H
+                snap.getContext('2d').drawImage(merged, 0, 0)
+                setMaskTexture(sel.layer.baseTextureKey, snap)
+            }
+            updateLayer(clickMaskId, { growPx: 0 })
+            bump()
+            aiSet({ status: `${add ? 'Added' : 'Removed'} region (${res.ms} ms) — click to ADD · Alt+click to REMOVE · Done to finish` })
+        } else {
+            setClickMaskId(commitAiMask(res, { label: 'AI Click-Select' }))
+            aiSet({ status: `Selected (${res.ms} ms) — click to ADD another region · Alt+click to REMOVE · Done to finish` })
+        }
+    }, [runAi, commitAiMask, aiSet, clickMaskId, chain, updateLayer, W, H])
+
+    // Engine self-check: what the device actually resolved to, and a real
+    // end-to-end selection on the current frame rather than a synthetic scene.
+    const testDevice = useCallback(async () => {
+        aiSet({ busy: true, status: 'Checking the device…' })
         try {
-            // Prompt SAM positively at the click to segment the object there.
-            let blob = null
-            const svc = await ensureService()
-            if (svc.status === 'available') {
-                try { blob = await serviceSamClick(srcRef.current, [[last.x, last.y]], [1], { width: W, height: H }) } catch { blob = null }
+            const mod = await engine()
+            const { capability } = await mod.boot()
+            await mod.warm({ withEncoder: true })
+            const st = mod.status()
+            const canvas = srcRef.current
+            let probeMs = null
+            let ok = false
+            if (canvas) {
+                const t0 = Date.now()
+                const r = await mod.select(canvas, { clicks: [[canvas.width / 2, canvas.height / 2, 1]] })
+                probeMs = Date.now() - t0
+                ok = !!r && !r.stale && r.usable
             }
-            let onDevice = false
-            if (!blob) { blob = await runSamClick([[last.x, last.y]], [1]); onDevice = true }
+            aiSet({
+                busy: false,
+                engine: st,
+                status: ok
+                    ? `On-device AI works — ${st.lane} on ${String(st.device || 'webgpu').toUpperCase()}, selection in ${probeMs} ms`
+                    : 'Engine is up but the probe selection returned nothing usable',
+                report: {
+                    caps: [
+                        ['WebGPU', !!capability?.webgpu],
+                        ['shader-f16', !!capability?.f16],
+                        [String(capability?.gpuTier || 'gpu'), capability?.gpuTier === 'accelerated'],
+                        ['Selection', ok],
+                    ],
+                },
+            })
+        } catch (err) { aiSet({ busy: false, status: 'Device check failed: ' + (err?.message || err) }) }
+    }, [aiSet])
 
-            const sel = clickMaskId ? chain.find(e => e.layer.id === clickMaskId) : null
-            if (sel) {
-                // Composite the SAM blob into the active mask's coverage (white =
-                // selected, opaque). Union via 'lighten'; subtract by multiplying
-                // in the blob's inverse (white-blob → black → zeroes coverage).
-                const key = sel.layer.maskTextureKey
-                const acc = document.createElement('canvas'); acc.width = W; acc.height = H
-                const ax = acc.getContext('2d')
-                ax.fillStyle = '#000'; ax.fillRect(0, 0, W, H)
-                const cur = key && getMaskTexture(key)
-                if (cur && cur.width) ax.drawImage(cur, 0, 0, W, H)
-                if (add) {
-                    ax.globalCompositeOperation = 'lighten'
-                    ax.drawImage(blob, 0, 0, W, H)
-                } else {
-                    const inv = document.createElement('canvas'); inv.width = W; inv.height = H
-                    const ix = inv.getContext('2d')
-                    ix.drawImage(blob, 0, 0, W, H)
-                    ix.globalCompositeOperation = 'difference'
-                    ix.fillStyle = '#fff'; ix.fillRect(0, 0, W, H)  // 255 − blob = inverse
-                    ax.globalCompositeOperation = 'multiply'
-                    ax.drawImage(inv, 0, 0)
-                }
-                ax.globalCompositeOperation = 'source-over'
-                if (key) setMaskTexture(key, acc)
-                // Re-base the boundary grow/shrink origin to the refined edge.
-                const baseKey = sel.layer.baseTextureKey
-                if (baseKey) {
-                    const snap = document.createElement('canvas'); snap.width = W; snap.height = H
-                    snap.getContext('2d').drawImage(acc, 0, 0)
-                    setMaskTexture(baseKey, snap)
-                }
-                updateLayer(clickMaskId, { growPx: 0 })
-                bump()
-            } else {
-                // No active mask — first click seeds a fresh AI Click-Select layer.
-                const keys = registerTexture(blob)
-                const lid = commit({ ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather: 0.02, label: 'AI Click-Select' }), baseTextureKey: keys.baseTextureKey, growPx: 0, ...newFillProps('semantic') })
-                setClickMaskId(lid)
+    /* ── HD export ─────────────────────────────────────────────────────────
+     * The graded frame at export resolution. The original is re-decoded from
+     * the bytes asset-store kept (never a resident full-res RGBA), the mask
+     * textures upscale cleanly because they carry continuous coverage rather
+     * than a bitmask, and the megashader renders the same chain at the larger
+     * size. Bounded by the budget, so the peak is predictable. */
+    const exportHd = useCallback(async () => {
+        if (!srcRef.current || ai.busy) return
+        aiSet({ busy: true, status: 'Re-decoding the original for export…' })
+        let owned = null
+        try {
+            const mod = await engine()
+            const out = await mod.exportSource()
+            if (!out) throw new Error('no original held — re-import the image')
+            owned = out.owned ? out.source : null
+            const hd = document.createElement('canvas')
+            hd.width = out.width
+            hd.height = out.height
+            hd.getContext('2d').drawImage(out.source, 0, 0, hd.width, hd.height)
+
+            const k = hd.width / W
+            const scaled = chain.map((e) => ({ op: e.op, layer: scaleLayer(e.layer, k) }))
+            let working = hd
+            if (hasGrade(baseLayer)) {
+                const baked = renderMegashader(hd, { chain: [{ layer: sanitiseLayer(scaleLayer(baseLayer, k)), op: 'replace' }] }, {})
+                if (baked) working = baked
             }
+            const result = renderMegashader(working, { chain: scaled.map((e) => ({ layer: sanitiseLayer(e.layer), op: e.op })) }, { globalInvert })
+            const blob = await new Promise((res) => (result || working).toBlob(res, 'image/png'))
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `mask-studio-${hd.width}x${hd.height}.png`
+            a.click()
+            setTimeout(() => URL.revokeObjectURL(url), 10_000)
+            aiSet({ busy: false, status: `Exported ${hd.width}×${hd.height}${out.bounded ? ' (bounded by the memory budget)' : ''}` })
+        } catch (err) {
+            console.error('[studio] export failed', err)
+            aiSet({ busy: false, status: 'Export failed: ' + (err?.message || err) })
+        } finally {
+            try { owned?.close?.() } catch { /* already gone */ }
+        }
+    }, [ai.busy, aiSet, chain, baseLayer, globalInvert, W])
 
-            const st = onDevice ? (samRef.current?.device || 'device') : 'SAM 3.1'
-            aiSet({ busy: false, status: `${sel ? (add ? 'Added' : 'Removed') + ' region' : 'Selected'} on ${st} — click to ADD · Alt+click to REMOVE · Done to finish`, device: st })
-        } catch (e) { aiSet({ busy: false, status: 'Click-Select failed: ' + (e?.message || e) }) }
-    }, [ai.busy, W, H, commit, ensureService, clickMaskId, chain, updateLayer])
-
-    // Unified palette dispatch: AI tools run an on-device model; everything else
+    // Unified palette dispatch: AI tools run the on-device lane; everything else
     // opens its canvas interaction — no separation between AI and regular masks.
     const onToolClick = useCallback((t) => {
         if (t.ai === 'subject') return runSubject()
-        if (t.ai === 'background') return runSubject(undefined, { invert: true })
-        if (t.ai === 'depth') return runDepth()
-        if (t.ai === 'sam') { setTool('sam'); setStatus('Drag a box around an object to select it (SAM 3.1)'); return }
+        if (t.ai === 'background') return runSubject({ invert: true })
+        if (t.ai === 'sam') { setTool('sam'); setStatus('Drag a box around an object to select it'); return }
+        if (t.ai === 'ailasso') { setAiLasso(null); setTool('ailasso'); setStatus('Draw a rough loop around the object — release to snap'); return }
         if (t.ai === 'clickselect') {
             setClickPoints([])
             // If a semantic mask (AI Subject / Box-Select / a prior Click-Select)
             // is selected, REFINE it: clicks add/remove regions on that mask. With
             // nothing selected, the first click seeds a fresh selection instead.
-            const sel = chain.find(e => e.layer.id === selectedId)?.layer
+            const sel = chain.find((e) => e.layer.id === selectedId)?.layer
             const refine = !!sel && sel.kind === 'semantic' && !!sel.maskTextureKey
             setClickMaskId(refine ? sel.id : null)
             setTool('clickselect')
@@ -1169,7 +1010,7 @@ function App() {
             return
         }
         return addMask(t)
-    }, [runSubject, runDepth, addMask, chain, selectedId])
+    }, [runSubject, addMask, chain, selectedId])
 
     const sampleColor = (p) => {
         const src = srcRef.current
@@ -1210,6 +1051,14 @@ function App() {
     }, [undo, redo])
 
     /* ── live render ───────────────────────────────────────────────────── */
+    // Deliberately NOT rAF-coalesced. It looks like it should be — every pass
+    // renders the whole proxy on the GPU and reads it back — but the renderer's own
+    // drawCount says the waste is not there: measured over paced 120 Hz drags, a
+    // brush stroke draws 17 times in 52 frames, a rubber-band once in 43, and a
+    // gradeless handle drag not at all (the stack short-circuits). React's batching
+    // and scheduleBrushSync's rAF already hold it to at most one draw per frame.
+    // Adding another rAF only pushed the brush a frame later — 5 frames over 25 ms
+    // in a stroke that previously had none.
     useEffect(() => {
         const src = srcRef.current
         const disp = dispRef.current
@@ -1315,7 +1164,7 @@ function App() {
             // brush-refining) while the pixels underneath stay fully visible. FILL
             // mode already paints the region in its fill colour, so skip it there.
             const key = sel.maskTextureKey || sel.brushTextureKey
-            drawMaskBoundary(g, key && getMaskTexture(key), W, H, ipx)
+            drawMaskBoundary(g, key && getMaskTexture(key), key, W, H, ipx)
         }
 
         // active pen draft
@@ -1325,6 +1174,18 @@ function App() {
             for (let i = 1; i < draft.length; i++) g.lineTo(draft[i].x, draft[i].y)
             g.stroke()
             draft.forEach((p, i) => handle(p.x, p.y, i === 0 ? '#fff' : ACCENT))
+        }
+
+        // active AI-lasso stroke — drawn closed, because that is the shape the
+        // clamp actually uses (the stroke is auto-closed before it is rasterised).
+        if (aiLasso && aiLasso.length > 1) {
+            g.strokeStyle = ACCENT; g.lineWidth = LW * 1.4; g.setLineDash([7 * ipx, 5 * ipx])
+            g.lineJoin = 'round'; g.lineCap = 'round'
+            g.beginPath(); g.moveTo(aiLasso[0].x, aiLasso[0].y)
+            for (let i = 1; i < aiLasso.length; i++) g.lineTo(aiLasso[i].x, aiLasso[i].y)
+            g.closePath(); g.stroke()
+            g.setLineDash([])
+            g.fillStyle = 'rgba(83,216,255,0.08)'; g.fill()
         }
 
         // active box-select rubber-band
@@ -1354,7 +1215,7 @@ function App() {
                 }
             })
         }
-    }, [chain, selectedId, tool, draft, samBox, clickPoints, imageSize, W, H, tick, preview])
+    }, [chain, selectedId, tool, draft, samBox, aiLasso, clickPoints, imageSize, W, H, tick, preview])
 
     /* ── imperative hooks for the dev-browser test ─────────────────────── */
     useEffect(() => {
@@ -1386,21 +1247,16 @@ function App() {
             expandBoundary: (id, px) => onExpandBoundary(id, px),
             refine: () => startRefine(),
             runSubject: () => runSubject(),
-            background: () => runSubject(undefined, { invert: true }),
-            runDepth: () => runDepth(),
+            background: () => runSubject({ invert: true }),
             samBox: (x0, y0, x1, y1) => onSamBox([x0, y0, x1, y1]),
+            aiLasso: (pts) => onAiLasso(pts),
             clickSelect: (x, y, label = 1) => { const pts = [...clickPoints, { x, y, label }]; setClickPoints(pts); onClickSelect(pts) },
+            findText: (phrase) => runText(phrase),
             testDevice: () => testDevice(),
-            serviceStatus: () => ai.service,
-            checkService: async () => {
-                aiSet({ service: { status: 'checking' } })
-                const s = await checkService()
-                aiSet({ service: { status: s.available ? 'available' : 'offline', sam3: s.sam3, sam3Loaded: s.sam3Loaded, model: s.model, subjectEngine: s.subjectEngine } })
-                return s
-            },
-            runConcept: (concept) => runSubject(concept),
-            setSensitivity: (v) => aiSet({ sensitivity: Number(v) }),
-            setFillHoles: (v) => aiSet({ fillHoles: !!v }),
+            exportHd: () => exportHd(),
+            engine: async () => (await engine()).status(),
+            budget: async () => (await engine()).engineBudget(),
+            shed: async (level) => (await engine()).shed(level),
             aiState: () => ai,
             layer: (id) => {
                 const l = chain.find((e) => e.layer.id === id)?.layer
@@ -1410,9 +1266,32 @@ function App() {
                 const d = dispRef.current
                 return d.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, d.width, d.height).data
             },
+            // Renderer counters — program-cache hit rate, compile time, draw
+            // count. The only way to tell a shader recompile from a slow draw.
+            renderMetrics: () => getRenderMetrics(),
+            resetRenderMetrics: () => resetRenderMetrics(),
         }
         window.__ready = true
-    }, [imageSize, chain, baseLayer, W, H, commit, updateLayer, setFillMode, applyCurve, onExpandBoundary, ai, runSubject, runDepth, testDevice, onSamBox, onClickSelect, clickPoints, undo, redo, startRefine])
+    }, [imageSize, chain, baseLayer, W, H, commit, updateLayer, setFillMode, applyCurve, onExpandBoundary, ai, runSubject, runText, testDevice, exportHd, onSamBox, onAiLasso, onClickSelect, clickPoints, undo, redo, startRefine])
+
+    // Engine chip: what the lane actually resolved to, never what it intends to
+    // use. Stays "starting…" until a session exists.
+    const engineChip = useMemo(() => {
+        const e = ai.engine
+        if (!e) return { text: 'engine…', ok: false, title: 'probing the device' }
+        if (!e.ready) return { text: 'starting…', ok: false, title: `${e.lane} · ${e.gpuTier} GPU` }
+        const dev = String(e.device || 'webgpu').toUpperCase()
+        const ms = e.lastRun?.ms
+        return {
+            text: `${dev} ✓${e.pressure ? ` · P${e.pressure}` : ''}`,
+            ok: true,
+            title: `${e.lane} · ${e.mode || 'worker'} · proxy ≤${e.proxyMax}px${ms ? ` · last selection ${ms} ms` : ''}`,
+        }
+    }, [ai.engine])
+
+    textureLayers.current = chain.reduce(
+        (n, e) => n + (e.layer.maskTextureKey || e.layer.brushTextureKey ? 1 : 0), 0,
+    )
 
     const selected = chain.find((e) => e.layer.id === selectedId) || null
     // Brush-refine targets texture-backed masks whose coverage is paintable
@@ -1428,8 +1307,12 @@ function App() {
                 <h1>Mask <b>Studio</b></h1>
                 <label className="mask-btn" style={{ cursor: 'pointer' }}>
                     Load image
-                    <input type="file" accept="image/*" onChange={onFile} style={{ display: 'none' }} />
+                    <input type="file" accept="image/*,.nef,.nrw,.cr2,.cr3,.arw,.dng,.orf,.rw2,.raf,.pef,.srw" onChange={onFile} style={{ display: 'none' }} />
                 </label>
+                <button className="mask-btn" disabled={!hasImage || ai.busy} onClick={exportHd}
+                    title="Re-decode the original at export resolution and render the full mask chain onto it">
+                    ⤓ Export HD
+                </button>
                 <div className="spacer" />
                 <button className="mask-btn" onClick={undo} title="Undo (⌘/Ctrl+Z)">↶ Undo</button>
                 <button className="mask-btn" onClick={redo} title="Redo (⌘/Ctrl+Shift+Z)">↷ Redo</button>
@@ -1457,7 +1340,7 @@ function App() {
                             {(tool === 'brush' || tool === 'refine') && <div ref={cursorRef} className="brush-cursor" />}
                             {tool && (
                                 <div className="tool-banner">
-                                    <span><b>{tool === 'sam' ? 'box-select' : tool === 'clickselect' ? 'click-select' : tool === 'refine' ? 'brush-refine' : tool}</b> · {status || 'draw on the image'}</span>
+                                    <span><b>{TOOL_TITLE[tool] || tool}</b> · {ai.busy ? (ai.status || 'working…') : (status || 'draw on the image')}</span>
                                     {tool === 'pen' && <button className="mask-btn" onClick={closePen}>Close path</button>}
                                     {tool === 'refine' && (
                                         <div className="seg" role="group" aria-label="brush-refine mode">
@@ -1483,7 +1366,7 @@ function App() {
                                             </button>
                                         </>
                                     )}
-                                    <button className="mask-btn" onClick={() => { setTool(null); setDraft([]); setSamBox(null); setClickPoints([]); setClickMaskId(null); refineRef.current = null; setStatus('') }}>Done</button>
+                                    <button className="mask-btn" onClick={() => { setTool(null); setDraft([]); setSamBox(null); setAiLasso(null); setClickPoints([]); setClickMaskId(null); refineRef.current = null; setStatus('') }}>Done</button>
                                 </div>
                             )}
                         </div>
@@ -1523,11 +1406,8 @@ function App() {
                         <div className="section">
                             <div className="section-head">
                                 <label className="panel-label">Masks</label>
-                                <span className="ai-badge" title="mask service / AI backend">
-                                    {ai.service?.status === 'available'
-                                        ? (ai.service.sam3 ? 'SAM 3.1 ✓' : 'service ✓')
-                                        : ai.service?.status === 'checking' ? 'service…'
-                                            : (ai.device ? String(ai.device).toUpperCase() : 'on-device')}
+                                <span className={`ai-badge ${engineChip.ok ? 'ai-badge--ok' : ''}`} title={engineChip.title}>
+                                    {engineChip.text}
                                 </span>
                             </div>
                             <div className="add-grid">
@@ -1546,7 +1426,7 @@ function App() {
                                 })}
                             </div>
                             <div className="ai-row">
-                                <input className="ai-input" placeholder="AI: describe a region… e.g. the sky" value={aiPhrase}
+                                <input className="ai-input" placeholder="AI: describe an object… e.g. the red car" value={aiPhrase}
                                     disabled={ai.busy}
                                     onChange={(e) => setAiPhrase(e.target.value)}
                                     onKeyDown={(e) => { if (e.key === 'Enter') runText(aiPhrase) }} />
@@ -1556,18 +1436,15 @@ function App() {
                                 <label className="mask-toggle"><input type="checkbox" checked={penSmooth} onChange={(e) => setPenSmooth(e.target.checked)} /> Pen: smooth</label>
                                 <label className="mask-toggle"><input type="checkbox" checked={edgeAware} onChange={(e) => setEdgeAware(e.target.checked)} /> Brush: edge-aware</label>
                             </div>
-                            <div className="global-row" title="On-device AI Subject cleanup — used when the SAM 3.1 service is offline">
-                                <label className="mask-toggle" style={{ gap: 6 }}>
-                                    Sensitivity
-                                    <input type="range" className="mask-range" min={0} max={1} step={0.05}
-                                        value={ai.sensitivity ?? 0.5} disabled={ai.busy}
-                                        onChange={(e) => aiSet({ sensitivity: Number(e.target.value) })} style={{ width: 80 }} />
-                                </label>
-                                <label className="mask-toggle"><input type="checkbox" checked={ai.fillHoles !== false} disabled={ai.busy} onChange={(e) => aiSet({ fillHoles: e.target.checked })} /> Fill holes</label>
-                            </div>
+                            {ai.progress && (
+                                <div className="ai-progress" title={ai.progress.file}>
+                                    <div className="ai-progress-bar" style={{ width: `${Math.min(100, (ai.progress.loaded / ai.progress.total) * 100).toFixed(1)}%` }} />
+                                    <span>{ai.progress.file} · {mb(ai.progress.loaded)} / {mb(ai.progress.total)}</span>
+                                </div>
+                            )}
                             {ai.status && <div className="ai-status">{ai.busy ? '⏳ ' : ''}{ai.status}</div>}
-                            {ai.lastFragmented && !ai.busy && (
-                                <div className="ai-status">💡 The auto subject matte looked fragmented — <b>AI Box-Select</b> (drag a box around the object) usually nails stylized / backlit subjects.</div>
+                            {ai.pressure > 0 && (
+                                <div className="ai-status">⚠︎ Memory pressure level {ai.pressure} — the governor released heavy caches; selections still work, exports are capped.</div>
                             )}
                             {ai.report?.caps && (
                                 <div className="ai-report">
@@ -1581,7 +1458,9 @@ function App() {
                             </div>
                             <div className="ai-foot">
                                 <button className="link-btn" disabled={ai.busy} onClick={testDevice}>{ai.busy ? 'checking…' : 'Test device AI'}</button>
-                                <span className="ai-note">AI runs in-browser (WebGPU→WASM); models cache after first use; nothing leaves your device.</span>
+                                <span className="ai-note">
+                                    SAM 2.1 (fp16) runs in this browser on WebGPU. No upload endpoint, no server, no cloud — drop a JPEG, PNG, HEIF or a camera RAW and every pixel stays on this device.
+                                </span>
                             </div>
                         </div>
 

@@ -1,0 +1,33 @@
+{
+  "onnxruntimeWeb": "1.27.0",
+  "lane": "sam2.1-small",
+  "precision": "fp16",
+  "detector": null,
+  "generatedAt": "2026-08-09T02:05:13.758Z",
+  "files": [
+    {
+      "path": "lib/ort-web/ort.webgpu.bundle.min.mjs",
+      "bytes": 113116
+    },
+    {
+      "path": "lib/ort-web/ort-wasm-simd-threaded.asyncify.mjs",
+      "bytes": 47507
+    },
+    {
+      "path": "lib/ort-web/ort-wasm-simd-threaded.asyncify.wasm",
+      "bytes": 24254953
+    },
+    {
+      "path": "models/sam21/encoder.fp16.onnx",
+      "bytes": 81438230
+    },
+    {
+      "path": "models/sam21/decoder.fp16.onnx",
+      "bytes": 10379869
+    },
+    {
+      "path": "models/sam21/model.json",
+      "bytes": 862
+    }
+  ]
+}

@@ -264,7 +264,20 @@ html, body {
 .ai-row { display: flex; gap: 7px; }
 .ai-input { flex: 1; min-width: 0; font-size: 11px; font-family: inherit; padding: 7px 9px; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-base); color: var(--text-primary); outline: none; }
 .ai-input:focus { border-color: rgba(83,216,255,0.4); }
+.ai-badge--ok { background: rgba(155,249,91,0.14); color: #9bf95b; }
 .ai-status { font-size: 10.5px; color: var(--text-secondary); line-height: 1.5; padding: 2px 0; }
+/* Weight-download meter. The bar is a background layer behind the label so a
+   long filename never reflows while bytes tick up. */
+.ai-progress {
+  position: relative; overflow: hidden; border-radius: 6px; padding: 5px 8px;
+  background: rgba(83,216,255,0.07); border: 1px solid var(--border-subtle);
+  font-size: 10px; color: var(--text-secondary); white-space: nowrap; text-overflow: ellipsis;
+}
+.ai-progress > span { position: relative; }
+.ai-progress-bar {
+  position: absolute; inset: 0 auto 0 0; background: rgba(83,216,255,0.18);
+  transition: width 180ms linear;
+}
 .ai-report { display: flex; gap: 7px; flex-wrap: wrap; }
 .ai-cap { font-size: 10px; font-weight: 600; padding: 3px 8px; border-radius: 6px; }
 .ai-cap.ok { background: rgba(155,249,91,0.14); color: #9bf95b; }

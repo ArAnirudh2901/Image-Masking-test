@@ -7,8 +7,14 @@ chunk-*.js.map
 
 # ── ONNX Runtime WASM files ────────────────────────────────────────────────────
 # Large (~77 MB total) runtime files for onnxruntime-web / @huggingface/transformers.
-# Copy these from your onnxruntime-web node_modules dist, or download them manually.
-# See: https://onnxruntime.ai/docs/get-started/with-javascript/web.html
+# ── Vendored runtime + weights (bun run models) ───────────────────────────────
+# ~227 MB. Produced by scripts/download-models.mjs; never committed. Without
+# them the app falls back to the pinned CDN on first use.
+lib/ort-web/
+models/*/
+!models/manifest.json
+
+# Retired: the old transformers.js path pointed onnxruntime-web here.
 ort/
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
@@ -37,3 +43,6 @@ test.png
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
 *.log
+
+# bench corpus — ~200 MB of camera files, regenerate with bench/make-corpus.mjs
+bench/corpus/

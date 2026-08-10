@@ -3,14 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mask Studio — phosmith megashader testbed</title>
+  <title>Mask Studio — megashader masking on an on-device SAM 2.1 lane</title>
   <link rel="icon" href="data:," />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <!-- No web font on purpose. Under COEP `require-corp` (which serve.mjs sets so
+       the memory governor can read real bytes) a cross-origin stylesheet is an
+       extra CORS negotiation on the critical path, and the local monospace stack
+       in styles.css is already the intended look. Nothing here touches the
+       network, so the app boots identically offline. -->
   <link rel="stylesheet" href="styles.css" />
+  <link rel="modulepreload" href="ai/studio-bridge.js" />
+  <script type="module" src="app.js"></script>
 </head>
 <body>
   <div id="root"></div>
-  <script type="module" src="app.js"></script>
 </body>
 </html>
