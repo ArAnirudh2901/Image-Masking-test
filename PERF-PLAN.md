@@ -107,6 +107,49 @@ spending on the port.
    Toolchain exists (`ai/cv-refine-worker.js`, `public/wasm/cv-refine.wasm`);
    C sources are not in this repo.
 
+## Export variance explained — the memory governor, not the export
+
+   `PROF=0 profexport.mjs 2680558334.nef`, four consecutive runs:
+
+   | run | wall ms | long tasks ms | export resolution | proxy | bounded |
+   |---|---|---|---|---|---|
+   | 1 | 2362 | 1045 | 4243×2828 (12.0 MP) | 1536×1024 | yes |
+   | 2 | 2623 | 1397, 54 | 4243×2828 (12.0 MP) | 1536×1024 | yes |
+   | 3 | **291** | **none** | **2034×1186** (2.4 MP) | 1756×1024 | **no** |
+   | 4 | 918 | 435 | 4243×2828 (12.0 MP) | 1536×1024 | yes |
+
+   The 5× wall-time spread tracks the ~5× pixel-count ratio exactly.
+   `proxy-plan.js` re-plans the proxy under memory pressure, and `exportSource`
+   bounds the original by the governor's budget. When the budget is tight the
+   export resolution drops to ~2.4 MP and the entire export finishes in under
+   300 ms with zero long tasks. When it gets 12 MP, it takes 900–2600 ms with
+   a 400–1400 ms main-thread block.
+
+   **The variance is not in the export code. It is in which original resolution
+   the memory governor chose.** Any export-path optimisation must be measured at
+   a FIXED resolution — pin the budget or measure at a known `out.width`.
+
+## `(program)` attribution — GPU driver wait, not decode or GC
+
+   `TRACE=1 profexport.mjs` (devtools.timeline + gpu categories), 4243×2828:
+
+   | ms | event | where |
+   |---|---|---|
+   | 134 | `CommandBufferHelper::Finish` | renderer → GPU flush (WebGL drawArrays at 12 MP) |
+   | 39 | `RasterImplementation::ReadbackImagePixels` | `readPixels` |
+   | 29 | `CommandBufferHelper::Finish` | second GPU flush (the `hasGrade` bake pass) |
+   | 19 | `DoReadbackARGBImagePixelsINTERNAL` | actual pixel transfer |
+
+   No `ImageDecodeTask`, no `MajorGC`, no `DecodeImage`. The sampling
+   profiler's 881 ms `(program)` is almost entirely **GPU command-buffer wait**:
+   the main thread blocks in `WaitForGetOffset` while Metal executes the shader
+   and the readback completes.
+
+   The readPixels round-trip (`ReadbackImagePixels` + `DoReadbackARGBImagePixelsINTERNAL`)
+   is ~58 ms of the ~460 ms long task. Encoding the WebGL canvas directly would
+   skip this, but the larger win is keeping the GPU work off the main thread's
+   critical path entirely (OffscreenCanvas).
+
 ## Caveat
 
 SIMD reassociation of box-filter sums changes float rounding. `validate.mjs`

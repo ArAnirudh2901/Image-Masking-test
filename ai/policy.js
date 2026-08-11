@@ -21,63 +21,63 @@
 // The numbers are standard8's — built for "the worst device that reaches it",
 // which is now simply the device contract.
 const CONFIG = {
-        profile: 'standard8',
-        samIdleMs: 300_000,
-        memBudgetMB: 2200,   // ceiling, not a working set: the lane rests at ~1980
-        proxyMax: 1024,          // floor on the LONG edge; see proxyShortMax
-        // The encoder consumes a 1024x1024 SQUARE (sam21-lane drawImage), so the
-        // detail it can use is capped PER AXIS. Sizing only by the long edge
-        // starves the short one — a 3:2 frame at 1024x683 hands the encoder 683
-        // real rows stretched to 1024, wasting a third of its vertical capacity.
-        // Measured on the canonical NEF: reaching 1024 on the SHORT edge is
-        // worth +8.2 pt boundary IoU, ~10x what the whole refinement stage buys.
-        proxyShortMax: 1024,
-        proxyLongMax: 2048,      // hard stop for panoramas
-        proxyPixelMax: 2_100_000, // ~2:1 fully saturated; bounds proxy RGBA at 8.4 MB
-        proxyMode: 'auto',
-        displayMax: 2560,        // crisper preview (decoupled from the model proxy)
-        displayMode: 'auto',
-        directMaxMP: 3,
-        directMaxSide: 2560,
-        cropMaxSide: 1536,
-        exportMaxSide: 5120,
-        exportMaxMP: 12,         // the visible win: 8 → 12 MP cutouts (bounded peak)
-        exportFullRes: false,    // deliberately bounded (memory-close to lite)
-        escalateMaxMP: 12,
-        escalateMinIoU: 0.5,     // crop re-decode must agree with the proxy mask, or it is a different object
-        draftCacheMax: 1,        // still exactly one resident embedding
-        flagshipCacheMax: 0,
-        maxResidentHeavy: 1,
-        flagship: false,
-        detectorEvictOnEncode: true,
-        detectorIdleMs: 120_000,
-        // Text lane ceiling (proxy-plan detectorPlan). Cells are 640² detector
-        // inferences in one pass; 10 = full frame + 3x3, the depth §6 of
-        // DESIGN-TEXT-LANE measured small subjects need. The source decode is
-        // derived from the grid these buy (~1670 px at 3x3), so detectorMaxSide
-        // is a guardrail rather than the working limit — it binds only if the
-        // grid is ever raised. maxMP bounds a square/panorama, where a long-edge
-        // cap alone says nothing about the raster.
-        detectorMaxCells: 10,
-        detectorMaxSide: 2048,
-        detectorMaxMP: 3,
-        samWebGPU: true,
-        autoEscalate: false,     // interaction-time native re-decode → manual tiers only
-        hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
-        detectorDispose: 'idle',
-        eagerEncode: true,
-        cvRefine: true,
-        rawDevelop: true,
-        rawDevelopMaxMP: 50,
-        embedPersist: true,      // SAM 2.1 embeddings are 8 MB; OPFS turns a
-                                 //   revisit into a decode-only interaction
-        // The working copy is the re-decode SOURCE for escalation and export.
-        // 2560 capped it below its own consumers (exportMaxSide 5120,
-        // escalateMaxMP 12), so a bounded host got a worse export than an
-        // unbounded one for no reason. 4096² RGBA is ~67 MB — comfortably
-        // inside the measured ~1.8 GB total.
-        workingMaxSide: 4096,
-        pressureLevel: 0,
+    profile: 'standard8',
+    samIdleMs: 300_000,
+    memBudgetMB: 2200,   // ceiling, not a working set: the lane rests at ~1980
+    proxyMax: 1024,          // floor on the LONG edge; see proxyShortMax
+    // The encoder consumes a 1024x1024 SQUARE (sam21-lane drawImage), so the
+    // detail it can use is capped PER AXIS. Sizing only by the long edge
+    // starves the short one — a 3:2 frame at 1024x683 hands the encoder 683
+    // real rows stretched to 1024, wasting a third of its vertical capacity.
+    // Measured on the canonical NEF: reaching 1024 on the SHORT edge is
+    // worth +8.2 pt boundary IoU, ~10x what the whole refinement stage buys.
+    proxyShortMax: 1024,
+    proxyLongMax: 2048,      // hard stop for panoramas
+    proxyPixelMax: 2_100_000, // ~2:1 fully saturated; bounds proxy RGBA at 8.4 MB
+    proxyMode: 'auto',
+    displayMax: 2560,        // crisper preview (decoupled from the model proxy)
+    displayMode: 'auto',
+    directMaxMP: 3,
+    directMaxSide: 2560,
+    cropMaxSide: 1536,
+    exportMaxSide: 5120,
+    exportMaxMP: 12,         // the visible win: 8 → 12 MP cutouts (bounded peak)
+    exportFullRes: false,    // deliberately bounded (memory-close to lite)
+    escalateMaxMP: 12,
+    escalateMinIoU: 0.5,     // crop re-decode must agree with the proxy mask, or it is a different object
+    draftCacheMax: 1,        // still exactly one resident embedding
+    flagshipCacheMax: 0,
+    maxResidentHeavy: 1,
+    flagship: false,
+    detectorEvictOnEncode: true,
+    detectorIdleMs: 120_000,
+    // Text lane ceiling (proxy-plan detectorPlan). Cells are 640² detector
+    // inferences in one pass; 10 = full frame + 3x3, the depth §6 of
+    // DESIGN-TEXT-LANE measured small subjects need. The source decode is
+    // derived from the grid these buy (~1670 px at 3x3), so detectorMaxSide
+    // is a guardrail rather than the working limit — it binds only if the
+    // grid is ever raised. maxMP bounds a square/panorama, where a long-edge
+    // cap alone says nothing about the raster.
+    detectorMaxCells: 10,
+    detectorMaxSide: 2048,
+    detectorMaxMP: 3,
+    samWebGPU: true,
+    autoEscalate: false,     // interaction-time native re-decode → manual tiers only
+    hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
+    detectorDispose: 'idle',
+    eagerEncode: true,
+    cvRefine: true,
+    rawDevelop: true,
+    rawDevelopMaxMP: 50,
+    embedPersist: true,      // SAM 2.1 embeddings are 8 MB; OPFS turns a
+                             //   revisit into a decode-only interaction
+    // The working copy is the re-decode SOURCE for escalation and export.
+    // 2560 capped it below its own consumers (exportMaxSide 5120,
+    // escalateMaxMP 12), so a bounded host got a worse export than an
+    // unbounded one for no reason. 4096² RGBA is ~67 MB — comfortably
+    // inside the measured ~1.8 GB total.
+    workingMaxSide: 4096,
+    pressureLevel: 0,
 }
 const PRESETS = { standard8: CONFIG }
 

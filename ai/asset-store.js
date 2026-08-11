@@ -12,6 +12,7 @@
 import { readMeta, decodeProxy, decodeOpaque, STALE } from './decode-client.js'
 import { resizeOpts } from './decode-core.js'
 import { interactionPlan, displayPlan } from './proxy-plan.js'
+import { hashCanvas } from './canvas-hash.js'
 
 const store = {
     blob: null,        // compressed original — never full-res RGBA between operations
@@ -64,19 +65,7 @@ const drawOriented = (target, source, orientation) => {
     ctx.setTransform(1, 0, 0, 1, 0, 0)
 }
 
-/** Content hash: dims + FNV-1a over a 16×16 downsample (~1 ms). */
-export const hashCanvas = (canvas) => {
-    const c = makeCanvas(16, 16)
-    const ctx = c.getContext('2d', { willReadFrequently: true })
-    ctx.drawImage(canvas, 0, 0, 16, 16)
-    const px = ctx.getImageData(0, 0, 16, 16).data
-    let h = 0x811c9dc5
-    for (let i = 0; i < px.length; i += 1) {
-        h ^= px[i]
-        h = Math.imul(h, 0x01000193) >>> 0
-    }
-    return `${canvas.width}x${canvas.height}:${h.toString(16)}`
-}
+// hashCanvas imported from canvas-hash.js — shared reusable 16×16 canvas.
 
 export const releaseAsset = () => {
     try { store.drawable?.close?.() } catch { /* canvas has no close */ }

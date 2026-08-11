@@ -123,18 +123,38 @@ export const composeChannels = (ops, width, height, floor = null) => {
  * Dilate a 1-channel mask by `radius` px (chebyshev). Subtract ops grow by a
  * safety margin so removing an object never leaves a boundary-residue ring
  * where two decodes of the same object disagree by a pixel.
+ *
+ * Separable two-pass max filter: horizontal then vertical. O(width × height)
+ * regardless of mask coverage, vs the old O(selected_pixels × radius²) that
+ * did massive redundant writes on dense masks.
  */
-export const dilateChannel = (chan, width, height, radius = 2) => {
-    if (!radius) return chan
-    const out = new Uint8Array(chan.length)
-    for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-            if (!chan[y * width + x]) continue
-            const x0 = Math.max(0, x - radius)
-            const x1 = Math.min(width - 1, x + radius)
-            const y0 = Math.max(0, y - radius)
-            const y1 = Math.min(height - 1, y + radius)
-            for (let yy = y0; yy <= y1; yy += 1) out.fill(255, yy * width + x0, yy * width + x1 + 1)
+export const dilateChannel = (chan, w, h, r = 2) => {
+    if (!r) return chan
+    // Pass 1: horizontal max — sliding window of width 2r+1
+    const tmp = new Uint8Array(w * h)
+    for (let y = 0; y < h; y += 1) {
+        const row = y * w
+        let count = 0
+        for (let x = 0; x <= Math.min(r, w - 1); x += 1) if (chan[row + x]) count += 1
+        for (let x = 0; x < w; x += 1) {
+            const enter = x + r
+            if (enter < w && chan[row + enter]) count += 1
+            tmp[row + x] = count > 0 ? 255 : 0
+            const leave = x - r
+            if (leave >= 0 && chan[row + leave]) count -= 1
+        }
+    }
+    // Pass 2: vertical max on tmp → out
+    const out = new Uint8Array(w * h)
+    for (let x = 0; x < w; x += 1) {
+        let count = 0
+        for (let y = 0; y <= Math.min(r, h - 1); y += 1) if (tmp[y * w + x]) count += 1
+        for (let y = 0; y < h; y += 1) {
+            const enter = y + r
+            if (enter < h && tmp[enter * w + x]) count += 1
+            out[y * w + x] = count > 0 ? 255 : 0
+            const leave = y - r
+            if (leave >= 0 && tmp[leave * w + x]) count -= 1
         }
     }
     return out
@@ -163,11 +183,10 @@ export const pointInMask = (imageData, x, y, tolerance = 3) => {
  * 0.1%). Anything between — including very small masks — is legitimate:
  * minute-object selection is a first-class use case.
  */
-export const validateClickMask = ({ coverage, bbox }) => {
-    if (!bbox || coverage <= 0) return { usable: false, reason: 'empty mask (selection missed)' }
-    if (coverage >= 0.9995) return { usable: false, reason: 'solid mask (object not separated)' }
-    return { usable: true, reason: null }
-}
+export const validateClickMask = ({ coverage, bbox }) =>
+    !bbox || coverage <= 0 ? { usable: false, reason: 'empty mask (selection missed)' }
+    : coverage >= 0.9995   ? { usable: false, reason: 'solid mask (object not separated)' }
+    : { usable: true, reason: null }
 
 /* ─── Mask hygiene ───────────────────────────────────────────────────────── */
 

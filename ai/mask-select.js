@@ -40,23 +40,19 @@ const T = 0
  * boundary — the exact thing predicted IoU cannot see — collapses toward 0.
  */
 export const stabilityScore = (field, offset = 1) => {
-    let hi = 0
-    let lo = 0
+    let hi = 0, lo = 0
     for (let i = 0; i < field.length; i += 1) {
-        const v = field[i]
-        if (v > T + offset) hi += 1
-        if (v > T - offset) lo += 1
+        if (field[i] > T + offset) hi += 1
+        if (field[i] > T - offset) lo += 1
     }
     return lo ? hi / lo : 0
 }
 
 /** IoU of two logit fields at their zero crossing — "is this the same object". */
 export const fieldIoU = (a, b) => {
-    let inter = 0
-    let union = 0
+    let inter = 0, union = 0
     for (let i = 0; i < a.length; i += 1) {
-        const x = a[i] > T
-        const y = b[i] > T
+        const x = a[i] > T, y = b[i] > T
         if (x && y) inter += 1
         if (x || y) union += 1
     }
@@ -68,6 +64,32 @@ export const fieldArea = (f) => {
     let n = 0
     for (let i = 0; i < f.length; i += 1) if (f[i] > T) n += 1
     return n
+}
+
+/**
+ * Fused single-pass analysis: stability + area + IoU agreement with a previous
+ * field. Replaces 3 separate array walks per candidate (9 total → 3).
+ */
+const analyzeField = (field, previous, offset = 1) => {
+    let hi = 0, lo = 0, area = 0, inter = 0, union = 0
+    const hasPrev = !!previous
+    for (let i = 0, len = field.length; i < len; i += 1) {
+        const v = field[i]
+        const sel = v > T
+        if (sel) area += 1
+        if (v > T + offset) hi += 1
+        if (v > T - offset) lo += 1
+        if (hasPrev) {
+            const psel = previous[i] > T
+            if (sel && psel) inter += 1
+            if (sel || psel) union += 1
+        }
+    }
+    return {
+        stability: lo ? hi / lo : 0,
+        area,
+        agree: union ? inter / union : 0,
+    }
 }
 
 const clampi = (v, hi) => (v < 0 ? 0 : (v > hi ? hi : v))
@@ -178,16 +200,17 @@ export const chooseCandidate = ({
     const box = boxFromClicks(clicks)
     const stats = planes.map((p, i) => {
         const fit = promptFit(p, side, clicks, scale)
+        const af = analyzeField(p, previous)
         return {
             i,
             violations: fit.miss + fit.leak,
             miss: fit.miss,
             leak: fit.leak,
-            stability: stabilityScore(p),
+            stability: af.stability,
             inBox: box ? boxFraction(p, side, box, scale) : 1,
-            area: fieldArea(p),
+            area: af.area,
             score: scores[i] ?? 0,
-            agree: previous ? fieldIoU(previous, p) : 0,
+            agree: af.agree,
         }
     })
 

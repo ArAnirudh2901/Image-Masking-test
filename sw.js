@@ -135,14 +135,14 @@ self.addEventListener('fetch', (event) => {
                     return withCorp(fresh, request.url)
                 } catch {
                     const stale = await cache.match(request)
-                    if (stale) return withCorp(stale, request.url)
+                    if (stale) return withCorp(stale.clone(), request.url)
                     throw new Error('offline and no cached model pointer')
                 }
             }
 
             // Cache hit → serve immediately (no network).
             const cached = await cache.match(request)
-            if (cached) return withCorp(cached, request.url)
+            if (cached) return withCorp(cached.clone(), request.url)
 
             // Cache miss → fetch from network, store, then return.
             try {
