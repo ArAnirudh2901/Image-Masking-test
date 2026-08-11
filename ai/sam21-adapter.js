@@ -14,147 +14,15 @@
 import { SIDE, MASK_SIDE, LANE } from './sam21-lane.js'
 import { decodeMask, encodeImage, hello, hostMode } from './sam21-client.js'
 import { noteModel } from './model-registry.js'
-import { bandAlpha, bandAlphaRect, refineField, lastRefineStats } from './mask-refine.js'
+import { bandAlpha, refineField } from './mask-refine.js'
+import { bandWidth, postCompute, upsampleLogits as upsampleField } from './mask-post-core.js'
+import { postAsync, unpackPost } from './mask-post-client.js'
 import { fieldArea } from './mask-select.js'
 
 let greeted = false
 
-// Catmull-Rom (a = -0.5) cubic kernel, evaluated directly. Four taps per axis,
-// no matrices, no library — the whole upsample is ~16 multiply-adds per pixel.
-const cubic = (t) => {
-    const t2 = t * t
-    const t3 = t2 * t
-    // Returns the four tap weights for offsets -1, 0, +1, +2.
-    return [
-        -0.5 * t3 + t2 - 0.5 * t,
-        1.5 * t3 - 2.5 * t2 + 1,
-        -1.5 * t3 + 2 * t2 + 0.5 * t,
-        0.5 * t3 - 0.5 * t2,
-    ]
-}
-const clampIdx = (i) => (i < 0 ? 0 : (i > MASK_SIDE - 1 ? MASK_SIDE - 1 : i))
+const upsampleLogits = (logits, w, h) => upsampleField(logits, w, h, MASK_SIDE)
 
-/**
- * Upsample the continuous logit field, THEN threshold (DESIGN-MASK-LANE §10).
- * Thresholding at 256² and scaling the binary mask is what produces blocky,
- * stair-stepped edges, and no encoder upgrade fixes that. Bicubic on the score
- * field puts the zero crossing at sub-pixel position for free.
- *
- * Separable: rows are resampled once into a scratch buffer, then columns — so
- * the cost is 4 taps per axis rather than 16 per pixel. Row weights repeat for
- * every output row, so they are computed once up front.
- */
-const upsampleLogits = (logits, w, h) => {
-    const out = new Float32Array(w * h)
-    const sx = MASK_SIDE / w
-    const sy = MASK_SIDE / h
-
-    // Precompute the x taps: identical for every row.
-    const xi = new Int32Array(w * 4)
-    const xw = new Float32Array(w * 4)
-    for (let x = 0; x < w; x += 1) {
-        const fx = (x + 0.5) * sx - 0.5
-        const x0 = Math.floor(fx)
-        const k = cubic(fx - x0)
-        for (let t = 0; t < 4; t += 1) {
-            xi[x * 4 + t] = clampIdx(x0 - 1 + t)
-            xw[x * 4 + t] = k[t]
-        }
-    }
-
-    // Pass 1: resample rows → [MASK_SIDE][w]
-    const tmp = new Float32Array(MASK_SIDE * w)
-    for (let r = 0; r < MASK_SIDE; r += 1) {
-        const src = r * MASK_SIDE
-        const dst = r * w
-        for (let x = 0; x < w; x += 1) {
-            const b = x * 4
-            tmp[dst + x] = logits[src + xi[b]] * xw[b]
-                + logits[src + xi[b + 1]] * xw[b + 1]
-                + logits[src + xi[b + 2]] * xw[b + 2]
-                + logits[src + xi[b + 3]] * xw[b + 3]
-        }
-    }
-
-    // Pass 2: resample columns into the output field (still continuous) and
-    // track the transition band's bbox while the values are already in hand —
-    // refineField would otherwise need its own full-frame scan to find it.
-    const BAND = 6
-    let minX = w; let minY = h; let maxX = -1; let maxY = -1
-    for (let y = 0; y < h; y += 1) {
-        const fy = (y + 0.5) * sy - 0.5
-        const y0 = Math.floor(fy)
-        const k = cubic(fy - y0)
-        const r0 = clampIdx(y0 - 1) * w
-        const r1 = clampIdx(y0) * w
-        const r2 = clampIdx(y0 + 1) * w
-        const r3 = clampIdx(y0 + 2) * w
-        const row = y * w
-        for (let x = 0; x < w; x += 1) {
-            const v = tmp[r0 + x] * k[0] + tmp[r1 + x] * k[1]
-                + tmp[r2 + x] * k[2] + tmp[r3 + x] * k[3]
-            out[row + x] = v
-            if (v > -BAND && v < BAND) {
-                if (x < minX) minX = x
-                if (x > maxX) maxX = x
-                if (y < minY) minY = y
-                if (y > maxY) maxY = y
-            }
-        }
-    }
-    return { field: out, bbox: maxX < 0 ? null : [minX, minY, maxX, maxY] }
-}
-
-// The guide image is the SAME for every click on a photo, but getImageData
-// forces a GPU→CPU readback of the whole proxy (~2.8 MB) — measured, the single
-// largest cost on the click path. Read it once per image, not once per click.
-let guideCache = null
-const guidePixels = (canvas, imageKey, w, h) => {
-    if (guideCache && guideCache.key === imageKey && guideCache.w === w && guideCache.h === h) {
-        return guideCache.px
-    }
-    const px = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data
-    guideCache = { key: imageKey, w, h, px }
-    return px
-}
-
-// Narrow-band matting (§10 step 3): hard inside, hard outside, a soft ramp only
-// across the zero crossing — so hair and foliage keep a real gradient. It is
-// also what the downstream composite and cv-refine expect (coverage from R,
-// alpha from A).
-//
-// The band is specified in PIXELS and converted to logit units per image. A
-// fixed logit width is wrong: the field's slope at the boundary varies with the
-// object and with the upsample factor, so the same constant produced a 1 px
-// ramp on one frame and a 10 px smear on another. |∇field| at the crossing is
-// exactly the conversion factor.
-const BAND_PX = 1.5
-
-/** Mean |∇field| across the transition band → logit units per pixel. */
-const bandWidth = (field, w, bbox) => {
-    if (!bbox) return 1
-    const [x0, y0, x1, y1] = bbox
-    let acc = 0
-    let n = 0
-    for (let y = Math.max(1, y0); y < Math.min(y1 + 1, (field.length / w) - 1); y += 1) {
-        const row = y * w
-        for (let x = Math.max(1, x0); x < Math.min(x1 + 1, w - 1); x += 1) {
-            const v = field[row + x]
-            if (v < -1 || v > 1) continue          // only right at the crossing
-            const gx = field[row + x + 1] - field[row + x - 1]
-            const gy = field[row + w + x] - field[row - w + x]
-            acc += Math.hypot(gx, gy) * 0.5
-            n += 1
-        }
-    }
-    const grad = n ? acc / n : 1
-    // bandAlpha ramps across 2*band logit units, so the pixel width is
-    // 2*band/|grad| — solve for band. NO absolute floor: at export scale the
-    // field has been upsampled ~10x, so |grad| is legitimately ~10x smaller, and
-    // a fixed floor (0.25 was tried) forces a ~35 px smear instead of 1.5 px.
-    // The epsilon exists only to keep a degenerate flat field finite.
-    return Math.max(1e-3, (grad * BAND_PX) / 2)
-}
 
 /**
  * Run one selection. `canvas` is the proxy the app already holds; `clicks` are
@@ -239,7 +107,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const t2 = performance.now()
     const w = canvas.width
     const h = canvas.height
-    const { rgba, rawRgba } = postProcess(canvas, imageKey, dec.logits, w, h)
+    const { rgba, rawRgba } = await postProcessAsync(canvas, imageKey, dec.logits, w, h)
 
     // Park every candidate SAM already computed, ordered small → large, so the
     // app can answer "you took the wrong part of it" with a repaint. The
@@ -282,52 +150,44 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
 // which of four passes owns it.
 export let lastPostStages = null
 
-const postProcess = (canvas, imageKey, logits, w, h) => {
-    const tU = performance.now()
-    const { field, bbox } = upsampleLogits(logits, w, h)
-    // Raw first: the refinement rewrites `field` in place, and the app's
-    // raw/refined toggle needs both.
-    const tB = performance.now()
-    const BAND = bandWidth(field, w, bbox)
-    const tA = performance.now()
-    const rawRgba = bandAlpha(field, w, h, BAND)
-    const tR = performance.now()
-
-    // Guided filter against the photo's own luma: pulls the boundary onto the
-    // real object edge instead of wherever the 256² grid put it.
-    let rgba = rawRgba
-    let tG = tR
-    let tF = tR
-    try {
-        const px = guidePixels(canvas, imageKey, w, h)
-        tG = performance.now()
-        const rect = px && refineField(field, px, w, h, bbox, { radius: 8, eps: 1e-4, scale: 4 })
-        tF = performance.now()
-        if (rect) {
-            // Refinement only rewrote `rect`; the rest of the field is
-            // untouched, so copy the raw mask and re-threshold just that band
-            // instead of paying a second full-frame pass.
-            rgba = bandAlphaRect(field, w, rect, BAND, new Uint8ClampedArray(rawRgba))
-        }
-    } catch { /* guide unavailable (tainted canvas) — the raw mask still ships */ }
-
-    lastPostStages = {
-        upsampleMs: +(tB - tU).toFixed(1),
-        bandWidthMs: +(tA - tB).toFixed(1),
-        bandAlphaMs: +(tR - tA).toFixed(1),
-        guideMs: +(tG - tR).toFixed(1),
-        refineMs: +(tF - tG).toFixed(1),
-        rethresholdMs: +(performance.now() - tF).toFixed(1),
-        // Refinement cost is linear in the cells the filter walked; without the
-        // decomposition a slow refine is indistinguishable from a slow filter.
-        refineShape: lastRefineStats,
+// The guide image is the SAME for every click on a photo, but getImageData
+// forces a GPU→CPU readback of the whole proxy (~2.8 MB). Read it once per
+// image, not once per click. Only the in-process path uses this — the worker
+// keeps its own copy, and mask-post-client tracks which image that copy is for.
+let guideCache = null
+/** Release the in-process guide copy (memory pressure). */
+export const clearGuideCache = () => { guideCache = null }
+const guidePixels = (canvas, imageKey, w, h) => {
+    if (guideCache && guideCache.key === imageKey && guideCache.w === w && guideCache.h === h) {
+        return guideCache.px
     }
+    const px = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data
+    guideCache = { key: imageKey, w, h, px }
+    return px
+}
 
+/** Record what postCompute produced. Shared by the worker and in-process paths. */
+const adoptPost = (imageKey, w, h, out) => {
+    lastPostStages = out.stages
     // Keep the continuous field for export: upscaling a THRESHOLDED mask to
     // 8256×5504 is what makes edges stair-step, and no amount of export-time
     // filtering recovers from it (§10).
-    lastField = { imageKey, w, h, field }
-    return { rgba, rawRgba }
+    lastField = { imageKey, w, h, field: out.field }
+    return { rgba: out.rgba, rawRgba: out.rawRgba }
+}
+
+/** In-process post — the fallback, and the only path candidate cycling uses. */
+const postProcess = (canvas, imageKey, logits, w, h) => {
+    let guide = null
+    try { guide = guidePixels(canvas, imageKey, w, h) } catch { /* tainted canvas */ }
+    return adoptPost(imageKey, w, h, postCompute({ logits, guide, w, h, maskSide: MASK_SIDE }))
+}
+
+/** Off-thread post, falling back in-process so a broken worker costs jank only. */
+const postProcessAsync = async (canvas, imageKey, logits, w, h) => {
+    const reply = await postAsync({ canvas, imageKey, logits, w, h, maskSide: MASK_SIDE })
+    if (!reply) return postProcess(canvas, imageKey, logits, w, h)
+    return adoptPost(imageKey, w, h, unpackPost(reply))
 }
 
 /* ─── Candidate cycling ───────────────────────────────────────────────────────
@@ -359,11 +219,20 @@ const candidateInfo = () =>
 
 /**
  * Move to the next/previous candidate and re-run the post pipeline on it.
- * Synchronous on purpose — it is a repaint, and awaiting it would put it back
- * on the same footing as the decode it exists to avoid. Returns null when there
- * is nothing parked for `imageKey`, or only one distinct candidate.
+ * Async: dispatches to the mask-post worker so the ~90–134 ms of upsample +
+ * guided filter runs off the main thread. Falls back in-process when the
+ * worker is broken, same as sam21Segment.
+ *
+ * The original docblock said "synchronous on purpose — awaiting it would put
+ * it back on the same footing as the decode it exists to avoid." That
+ * reasoning predated the worker existing. Now that the worker is warm, the
+ * round-trip adds ~20 ms of latency (invisible for a ↑/↓ keypress) and
+ * removes ~130 ms of UI jank.
+ *
+ * Returns null when there is nothing parked for `imageKey`, or only one
+ * distinct candidate.
  */
-export const sam21Cycle = (delta = 1, imageKey = null) => {
+export const sam21Cycle = async (delta = 1, imageKey = null) => {
     if (!candidates || candidates.rows.length < 2) return null
     if (imageKey && candidates.imageKey !== imageKey) return null
     const t0 = performance.now()
@@ -371,7 +240,7 @@ export const sam21Cycle = (delta = 1, imageKey = null) => {
     candidates.index = (candidates.index + (delta < 0 ? n - 1 : 1)) % n
     const row = candidates.rows[candidates.index]
     const { canvas, w, h } = candidates
-    const { rgba, rawRgba } = postProcess(canvas, candidates.imageKey, row.p, w, h)
+    const { rgba, rawRgba } = await postProcessAsync(canvas, candidates.imageKey, row.p, w, h)
     return {
         rgba,
         rawRgba,

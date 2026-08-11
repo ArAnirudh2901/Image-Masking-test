@@ -43,7 +43,10 @@ const server = createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost')
         const rel = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname)
         const file = path.join(DIR, path.normalize(rel))
-        if (!file.startsWith(DIR)) { res.writeHead(403).end('forbidden'); return }
+        // Compare against DIR + separator: a bare startsWith also admits a
+        // sibling whose name merely begins with DIR's (…/studio-secrets).
+        const root = DIR.endsWith(path.sep) ? DIR : DIR + path.sep
+        if (!file.startsWith(root)) { res.writeHead(403).end('forbidden'); return }
 
         let info
         try { info = await stat(file) } catch { res.writeHead(404).end('not found'); return }
@@ -61,15 +64,19 @@ const server = createServer(async (req, res) => {
         }
 
         // Range: a partial weight fetch must not restart from byte 0.
+        // Single ranges only, including the `bytes=-N` suffix form. Multipart is
+        // ignored, which is a legal 200 — no client fetches weights that way.
         const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '')
-        if (range) {
-            const start = range[1] ? Number(range[1]) : 0
-            const end = range[2] ? Math.min(Number(range[2]), info.size - 1) : info.size - 1
+        if (range && (range[1] || range[2])) {
+            const suffix = !range[1]   // `bytes=-N` = the LAST n bytes, not 0..n
+            const start = suffix ? Math.max(0, info.size - Number(range[2])) : Number(range[1])
+            const end = suffix || !range[2] ? info.size - 1 : Math.min(Number(range[2]), info.size - 1)
             if (start >= info.size || start > end) {
                 res.writeHead(416, { 'Content-Range': `bytes */${info.size}` }).end()
                 return
             }
             res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${info.size}`, 'Content-Length': end - start + 1 })
+            if (req.method === 'HEAD') { res.end(); return }   // HEAD carries headers, never a body
             createReadStream(file, { start, end }).pipe(res)
             return
         }

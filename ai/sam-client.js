@@ -21,6 +21,7 @@ import { enqueueHeavy, cancelHeavyBefore, onHeavyActivity, STALE } from './heavy
 import { sam21Candidates, sam21Cycle, sam21HdCompose, sam21Segment } from './sam21-adapter.js'
 import { LANE } from './sam21-lane.js'
 import { noteModel } from './model-registry.js'
+import { contentKey } from './canvas-hash.js'
 
 // First text search may build a ~163 MB detector session and run its first
 // wasm inference in one call — minutes on a weak machine, not a hang.
@@ -152,27 +153,8 @@ export const warmEncoder = ({ speculative = false } = {}) => {
  *  back; re-arm so a later boot-style warm can rebuild it. */
 export const forgetEncoder = () => { encoderBuilt = false; encoderPromise = null }
 
-/**
- * Content key for the embedding cache: dims + FNV-1a over a 16×16
- * downsample. Content-addressed so the cache never serves stale embeddings
- * for new pixels. ~1 ms — negligible next to even a cached decode.
- */
-const contentKey = (canvas) => {
-    const c = document.createElement('canvas')
-    c.width = 16
-    c.height = 16
-    const ctx = c.getContext('2d', { willReadFrequently: true })
-    ctx.drawImage(canvas, 0, 0, 16, 16)
-    const px = ctx.getImageData(0, 0, 16, 16).data
-    let h = 0x811c9dc5
-    for (let i = 0; i < px.length; i += 1) {
-        h ^= px[i]
-        h = Math.imul(h, 0x01000193) >>> 0
-    }
-    // `doc:` namespaces whole-document embeddings; crop re-encodes will live
-    // under `crop:${hash}:${rect}` and must never collide with these.
-    return `doc:${canvas.width}x${canvas.height}:${h.toString(16)}`
-}
+// contentKey imported from canvas-hash.js — shared reusable 16×16 canvas,
+// zero GC pressure, 4-bytes-at-a-time FNV hash (256 vs 1024 iterations).
 
 /**
  * Run click/box/lasso selection fully on-device against `canvas` (the
@@ -281,13 +263,13 @@ function finishSegment(result, revision, startedAt) {
 /**
  * Step through SAM's other candidates for the selection already on screen.
  *
- * Deliberately NOT queued and NOT async: the planes are in memory, so this is
- * an upsample + guided filter, and routing it through enqueueHeavy would make a
- * repaint wait behind the decode it exists to replace. Returns the same shape
- * as `segment`, or null when there is nothing to cycle.
+ * NOT queued through enqueueHeavy: the planes are in memory, so this is an
+ * upsample + guided filter dispatched to the mask-post worker. Routing it
+ * through enqueueHeavy would make a repaint wait behind a decode.
+ * Returns the same shape as `segment`, or null when there is nothing to cycle.
  */
-export const cycleCandidate = (delta = 1) => {
-    const r = sam21Cycle(delta)
+export const cycleCandidate = async (delta = 1) => {
+    const r = await sam21Cycle(delta)
     return r ? finishSegment(r, null, Date.now()) : null
 }
 
@@ -475,9 +457,12 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs, kee
         // keepAlive: the caller has another pass of the SAME search coming and
         // will dispose itself. Without it a two-pass (escalated) search under
         // 'dispose now' rebuilds the whole YOLOE session between its own halves.
-        if (keepAlive) return
-        if (idleMs > 0) detectIdleTimer = setTimeout(disposeDetectWorker, idleMs)
-        else disposeDetectWorker()
+        // NB: never `return` here — a return inside finally overrides the try's
+        // resolved value and hands the caller undefined.
+        if (!keepAlive) {
+            if (idleMs > 0) detectIdleTimer = setTimeout(disposeDetectWorker, idleMs)
+            else disposeDetectWorker()
+        }
     }
 }
 
@@ -508,7 +493,7 @@ export const detectText = async (frames, phrases, {
         'detect',
         () => callDetectWorker(
             { lane: 'text', frames, phrases, known, threshold },
-            frames.map((f) => f.data.buffer), DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs, keepAlive,
+            keepAlive ? [] : frames.map((f) => f.data.buffer), DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs, keepAlive,
         ),
         { priority: 'normal', revision },
     )

@@ -124,32 +124,42 @@ const distToSeg = (a, b, p) => {
 // JS pass and 16 dilation draws — far too much to repeat per frame while a mask is
 // merely SELECTED. Memoised on the texture's content version (so a brush stroke
 // still invalidates it) plus the geometry that changes its appearance.
-const boundaryCache = { key: null, canvas: null }
+// Insertion-ordered LRU: one slot forced a full re-trace every time selection
+// alternated between two masks. Capped at 3 — each entry is a full-size RGBA
+// canvas (~16 MB at 2048²), so this trades bounded memory for the re-trace.
+const BOUNDARY_CACHE_MAX = 3
+const boundaryCache = new Map()
 
 const traceBoundary = (tex, key, W, H, ipx) => {
     const tw = tex.width, th = tex.height
     const id = `${key}@${getMaskTextureVersion(key)}:${tw}x${th}:${W}x${H}:${ipx.toFixed(3)}`
-    if (boundaryCache.key === id) return boundaryCache.canvas
+    const hit = boundaryCache.get(id)
+    if (hit) { boundaryCache.delete(id); boundaryCache.set(id, hit); return hit } // touch → most-recent
 
-    const sil = document.createElement('canvas'); sil.width = tw; sil.height = th
-    const sc = sil.getContext('2d', { willReadFrequently: true })
+    const r = Math.max(1.2, 2.2 * ipx * (tw / (W || tw)))
+
+    // 1. Threshold mask → binary silhouette via compositing (no pixel loop)
+    const sil = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : (() => { const c = document.createElement('canvas'); c.width = tw; c.height = th; return c })()
+    const sc = sil.getContext('2d')
     sc.drawImage(tex, 0, 0)
-    const img = sc.getImageData(0, 0, tw, th); const d = img.data
-    for (let i = 0; i < d.length; i += 4) {
-        const cov = d[i + 3] >= 250 ? d[i] : d[i + 3] // luma (opaque) or painted alpha
-        const on = cov >= 128 ? 255 : 0
-        d[i] = 0x53; d[i + 1] = 0xd8; d[i + 2] = 0xff; d[i + 3] = on
-    }
-    sc.putImageData(img, 0, 0)
-    const out = document.createElement('canvas'); out.width = tw; out.height = th
+    sc.globalCompositeOperation = 'source-in'
+    sc.fillStyle = '#53d8ff'
+    sc.fillRect(0, 0, tw, th)
+
+    // 2. Dilate via offset draws (adaptive step count instead of fixed 16)
+    const out = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : (() => { const c = document.createElement('canvas'); c.width = tw; c.height = th; return c })()
     const oc = out.getContext('2d')
-    const r = Math.max(1.2, 2.2 * ipx * (tw / (W || tw))) // ≈ constant on-screen width
-    for (let a = 0; a < Math.PI * 2 - 1e-3; a += Math.PI / 8) oc.drawImage(sil, Math.cos(a) * r, Math.sin(a) * r)
+    const steps = Math.max(8, Math.ceil(Math.PI * r))
+    for (let i = 0; i < steps; i += 1) {
+        const a = (i / steps) * Math.PI * 2
+        oc.drawImage(sil, Math.cos(a) * r, Math.sin(a) * r)
+    }
+    // 3. Punch out interior
     oc.globalCompositeOperation = 'destination-out'
     oc.drawImage(sil, 0, 0)
 
-    boundaryCache.key = id
-    boundaryCache.canvas = out
+    boundaryCache.set(id, out)
+    if (boundaryCache.size > BOUNDARY_CACHE_MAX) boundaryCache.delete(boundaryCache.keys().next().value)
     return out
 }
 
@@ -184,12 +194,17 @@ function App() {
     const brushRef = useRef(null)        // { canvas, ctx, key, baseKey, layerId, mode } for the active brush layer
     const refineRef = useRef(null)       // same shape — painting INTO the selected mask (brush-refine)
     const dragRef = useRef(null)         // transient drag state for radial/linear/brush
+    const chainRef = useRef([])           // always-current mirror of `chain` for callbacks
+    const baseLayerRef = useRef(null)      // always-current mirror of `baseLayer`
+    const lastSnapVersionsRef = useRef(new Map())  // U8: texture versions at last snapshot
     const rafRef = useRef(0)
     const cursorRef = useRef(null)       // floating brush-size ring (brush / refine)
 
     const [imageSize, setImageSize] = useState(null)
     const [chain, setChain] = useState([])         // [{ layer, op }]
+    chainRef.current = chain  // sync on every render — callbacks read this instead of closing over state
     const [baseLayer, setBaseLayer] = useState(null) // full-frame global/base grade (id 'base')
+    baseLayerRef.current = baseLayer
     const [histogram, setHistogram] = useState(null) // source histogram for the curve graphs
     const [compare, setCompare] = useState(false)  // hold-to-compare: show the ungraded source
     const [selectedId, setSelectedId] = useState(null)
@@ -201,6 +216,11 @@ function App() {
     const [draft, setDraft] = useState([])         // in-progress pen/lasso points (image px)
     const [samBox, setSamBox] = useState(null)     // in-progress box-select rubber-band {x0,y0,x1,y1}
     const [clickPoints, setClickPoints] = useState([])   // [{x,y,label}] for click-select (label: 1=pos, 0=neg)
+    // Ref mirror: appends must read the latest list even when two clicks land
+    // before React re-renders. Always write through putClickPoints, never the
+    // raw setter, or the ref goes stale and the next append drops a point.
+    const clickPointsRef = useRef([])
+    const putClickPoints = useCallback((next) => { clickPointsRef.current = next; setClickPoints(next) }, [])
     const [clickMaskId, setClickMaskId] = useState(null)  // layer ID of the live click-select mask being refined
     const [overlayMode, setOverlayMode] = useState(false)
     const [globalInvert, setGlobalInvert] = useState(false)
@@ -210,6 +230,10 @@ function App() {
     const [status, setStatus] = useState('')
     // On-device segmentation engine (ai/studio-bridge.js → seglab SAM 2.1 lane).
     const [ai, setAi] = useState({ busy: false, status: '', engine: null, progress: null, pressure: 0 })
+    // The latch that actually gates concurrent runs. `ai.busy` drives the UI but
+    // lags a render behind, so two clicks inside one frame both read false and
+    // launch. Guards must test this ref; `ai.busy` is for display only.
+    const aiBusyRef = useRef(false)
     const [aiPhrase, setAiPhrase] = useState('')
     const [aiLasso, setAiLasso] = useState(null)   // in-progress AI-lasso stroke (image px)
 
@@ -246,6 +270,8 @@ function App() {
             srcRef.current = canvas
             brushRef.current = null
             refineRef.current = null
+            dragRef.current = null        // Bug #3: prevent dangling pointer capture
+            boundaryCache.clear()         // Bug #5: release stale boundary canvases
             // Base/global grade carrier: a full-WHITE texture so one semantic
             // layer covers EVERY pixel (white = full coverage — no smoothstep
             // boundary, unlike a luminance(0..1) mask which under-covers pure
@@ -258,7 +284,7 @@ function App() {
             setHistogram(computeImageHistogram({ getElement: () => canvas }))
             setImageSize({ width: w, height: h })
             setChain([]); setSelectedId(null); setTool(null); setDraft([])
-            setClickPoints([]); setClickMaskId(null); setSamBox(null); setAiLasso(null)
+            putClickPoints([]); setClickMaskId(null); setSamBox(null); setAiLasso(null)
             setHasImage(true)
             const native = `${transform.originalW}×${transform.originalH}`
             setStatus(`${label || 'image'} · ${native} → ${w}×${h} interaction frame${transform.sourceWasRaw ? ' (RAW preview)' : ''}`)
@@ -343,7 +369,13 @@ function App() {
     const registerTexture = (canvas) => {
         const baseTextureKey = 'base-' + uid()
         const maskTextureKey = 'mask-' + uid()
-        setMaskTexture(baseTextureKey, canvas)
+        // Distinct canvases: nothing mutates this one in place today, but sharing
+        // the object is a footgun — any future in-place edit would silently
+        // rewrite the pristine base the boundary slider restores from.
+        const base = document.createElement('canvas')
+        base.width = canvas.width; base.height = canvas.height
+        base.getContext('2d').drawImage(canvas, 0, 0)
+        setMaskTexture(baseTextureKey, base)
         setMaskTexture(maskTextureKey, canvas)
         return { maskTextureKey, baseTextureKey, growPx: 0 }
     }
@@ -352,7 +384,8 @@ function App() {
     // absolute px amount from the pristine base (0 restores it). Drives the
     // MaskChainCard "Boundary" slider for AI Subject / lasso / brush masks.
     const onExpandBoundary = useCallback((id, px) => {
-        const layer = chain.find((e) => e.layer.id === id)?.layer
+        // Bug #1: read from chainRef (always current) instead of closed-over chain
+        const layer = chainRef.current.find((e) => e.layer.id === id)?.layer
         if (!layer) return
         const base = getMaskTexture(layer.baseTextureKey || layer.maskTextureKey)
         if (!base || typeof base.getContext !== 'function') return // need a real canvas
@@ -360,7 +393,7 @@ function App() {
         setMaskTexture(layer.maskTextureKey, grown)
         updateLayer(id, { growPx: px })
         bump()
-    }, [chain, updateLayer])
+    }, [updateLayer])  // no longer depends on `chain`
 
     /* ── add-mask handlers ─────────────────────────────────────────────── */
     const defaultFill = (kind) => {
@@ -397,7 +430,12 @@ function App() {
             const bc = document.createElement('canvas'); bc.width = W; bc.height = H
             const bx = bc.getContext('2d', { willReadFrequently: true })
             if (edgeAware) { bx.fillStyle = '#000'; bx.fillRect(0, 0, W, H) }
-            setMaskTexture(key, bc); setMaskTexture(baseKey, bc)
+            // Base needs its OWN canvas: strokes mutate bc in place, so sharing the
+            // object would let paint bleed into the pristine copy and make
+            // boundary grow/shrink cumulative instead of reversible.
+            const bbase = document.createElement('canvas'); bbase.width = W; bbase.height = H
+            bbase.getContext('2d').drawImage(bc, 0, 0)
+            setMaskTexture(key, bc); setMaskTexture(baseKey, bbase)
             // Edge-aware → smartBrush kind (bilateral edge snap in the shader);
             // else a plain brush. smartBrush samples brushTextureKey — we ALSO set
             // maskTextureKey=key so the boundary-grow + paint-sync use one key.
@@ -416,7 +454,7 @@ function App() {
             commit(l); setTool('color')
             setStatus('Color: click the image to sample the target colour')
         }
-    }, [imageSize, W, H, commit])
+    }, [imageSize, W, H, commit, edgeAware])
 
     /* ── pointer → image-space ─────────────────────────────────────────── */
     const toImage = (e) => {
@@ -471,10 +509,10 @@ function App() {
             e.preventDefault()
             // Drop clicks while a selection is in flight rather than dropping a
             // marker the run behind it will never honour.
-            if (ai.busy) return
+            if (aiBusyRef.current) return
             const label = e.altKey ? 0 : 1  // Alt+click = negative point
-            const newPts = [...clickPoints, { x: p.x, y: p.y, label }]
-            setClickPoints(newPts)
+            const newPts = [...clickPointsRef.current, { x: p.x, y: p.y, label }]
+            putClickPoints(newPts)
             onClickSelect(newPts)
             return
         }
@@ -576,7 +614,9 @@ function App() {
             // snapshot the painted canvas as the boundary base so grow/shrink
             // readjusts from the latest stroke (resets any prior boundary edit)
             if (t.baseKey) {
-                const snap = document.createElement('canvas'); snap.width = W; snap.height = H
+                // Bug #7: use actual canvas dimensions, not closure W/H
+                const cw = t.canvas.width, ch = t.canvas.height
+                const snap = document.createElement('canvas'); snap.width = cw; snap.height = ch
                 snap.getContext('2d').drawImage(t.canvas, 0, 0)
                 setMaskTexture(t.baseKey, snap)
             }
@@ -706,11 +746,36 @@ function App() {
     }
     // Immutable-update patterns (updateLayer/applyCurve always replace nested
     // objects) make a shallow layer copy safe to retain in a snapshot.
-    const snapshot = () => ({
-        chain: chain.map((e) => ({ op: e.op, layer: { ...e.layer } })),
-        base: baseLayer ? { ...baseLayer } : null,
-        textures: snapTextures(chain, baseLayer),
-    })
+    // Bug #2: reads from refs so the debounced timer always gets current state.
+    // U8: structural sharing — only clone textures whose version changed.
+    const snapshot = () => {
+        const curChain = chainRef.current
+        const curBase = baseLayerRef.current
+        const keys = new Set()
+        const collect = (l) => l && TEX_KEYS.forEach((k) => l[k] && keys.add(l[k]))
+        curChain.forEach((e) => collect(e.layer)); collect(curBase)
+
+        const prevVersions = lastSnapVersionsRef.current
+        const prevTextures = historyRef.current.present?.textures
+        const nextVersions = new Map()
+        const textures = new Map()
+        keys.forEach((k) => {
+            const ver = getMaskTextureVersion(k)
+            nextVersions.set(k, ver)
+            if (prevVersions.get(k) === ver && prevTextures?.has(k)) {
+                textures.set(k, prevTextures.get(k))  // reuse — unchanged since last snap
+            } else {
+                const c = cloneTex(getMaskTexture(k))
+                if (c) textures.set(k, c)
+            }
+        })
+        lastSnapVersionsRef.current = nextVersions
+        return {
+            chain: curChain.map((e) => ({ op: e.op, layer: { ...e.layer } })),
+            base: curBase ? { ...curBase } : null,
+            textures,
+        }
+    }
     const restore = (snap) => {
         snap.textures.forEach((tex, key) => { const c = cloneTex(tex); if (c) setMaskTexture(key, c) })
         restoringRef.current = true
@@ -812,7 +877,8 @@ function App() {
     // guard, engine-status refresh and error surface. Tools describe the run;
     // they never re-implement it.
     const runAi = useCallback(async (startStatus, work) => {
-        if (ai.busy || !srcRef.current) return null
+        if (aiBusyRef.current || !srcRef.current) return null
+        aiBusyRef.current = true
         aiSet({ busy: true, status: startStatus })
         try {
             const mod = await engine()
@@ -825,8 +891,10 @@ function App() {
             console.error('[studio] ai run failed', err)
             aiSet({ busy: false, status: (err?.message || String(err)) })
             return null
+        } finally {
+            aiBusyRef.current = false
         }
-    }, [ai.busy, aiSet])
+    }, [aiSet])
 
     // AI Subject / AI Sky·Background — the same mask, inverted for the second.
     // See studio-bridge.selectSubject for why this is three decoder probes over
@@ -951,7 +1019,8 @@ function App() {
      * than a bitmask, and the megashader renders the same chain at the larger
      * size. Bounded by the budget, so the peak is predictable. */
     const exportHd = useCallback(async () => {
-        if (!srcRef.current || ai.busy) return
+        if (!srcRef.current || aiBusyRef.current) return
+        aiBusyRef.current = true   // shares runAi's latch: an export blocks AI runs and vice versa
         aiSet({ busy: true, status: 'Re-decoding the original for export…' })
         let owned = null
         try {
@@ -964,6 +1033,8 @@ function App() {
             hd.height = out.height
             hd.getContext('2d').drawImage(out.source, 0, 0, hd.width, hd.height)
 
+            // Bug #4: guard against W===0 (imageSize null during rapid swap)
+            if (!W || !H) { aiSet({ busy: false, stage: '' }); return }
             const k = hd.width / W
             const scaled = chain.map((e) => ({ op: e.op, layer: scaleLayer(e.layer, k) }))
             let working = hd
@@ -972,7 +1043,20 @@ function App() {
                 if (baked) working = baked
             }
             const result = renderMegashader(working, { chain: scaled.map((e) => ({ layer: sanitiseLayer(e.layer), op: e.op })) }, { globalInvert })
-            const blob = await new Promise((res) => (result || working).toBlob(res, 'image/png'))
+            const src = result || working
+            // PNG encode off-thread: OffscreenCanvas.convertToBlob runs the
+            // encoder on a compositor thread, removing ~45 ms of main-thread
+            // blocking. The drawImage is cheap (canvas→canvas, same process).
+            // Falls back to the synchronous toBlob for browsers without
+            // OffscreenCanvas (Safari < 16.4).
+            let blob
+            if (typeof OffscreenCanvas !== 'undefined') {
+                const osc = new OffscreenCanvas(src.width, src.height)
+                osc.getContext('2d').drawImage(src, 0, 0)
+                blob = await osc.convertToBlob({ type: 'image/png' })
+            } else {
+                blob = await new Promise((res) => src.toBlob(res, 'image/png'))
+            }
             const url = URL.createObjectURL(blob)
             const a = document.createElement('a')
             a.href = url
@@ -984,9 +1068,10 @@ function App() {
             console.error('[studio] export failed', err)
             aiSet({ busy: false, status: 'Export failed: ' + (err?.message || err) })
         } finally {
+            aiBusyRef.current = false
             try { owned?.close?.() } catch { /* already gone */ }
         }
-    }, [ai.busy, aiSet, chain, baseLayer, globalInvert, W])
+    }, [aiSet, chain, baseLayer, globalInvert, W])
 
     // Unified palette dispatch: AI tools run the on-device lane; everything else
     // opens its canvas interaction — no separation between AI and regular masks.
@@ -996,7 +1081,7 @@ function App() {
         if (t.ai === 'sam') { setTool('sam'); setStatus('Drag a box around an object to select it'); return }
         if (t.ai === 'ailasso') { setAiLasso(null); setTool('ailasso'); setStatus('Draw a rough loop around the object — release to snap'); return }
         if (t.ai === 'clickselect') {
-            setClickPoints([])
+            putClickPoints([])
             // If a semantic mask (AI Subject / Box-Select / a prior Click-Select)
             // is selected, REFINE it: clicks add/remove regions on that mask. With
             // nothing selected, the first click seeds a fresh selection instead.
@@ -1250,7 +1335,7 @@ function App() {
             background: () => runSubject({ invert: true }),
             samBox: (x0, y0, x1, y1) => onSamBox([x0, y0, x1, y1]),
             aiLasso: (pts) => onAiLasso(pts),
-            clickSelect: (x, y, label = 1) => { const pts = [...clickPoints, { x, y, label }]; setClickPoints(pts); onClickSelect(pts) },
+            clickSelect: (x, y, label = 1) => { const pts = [...clickPointsRef.current, { x, y, label }]; putClickPoints(pts); onClickSelect(pts) },
             findText: (phrase) => runText(phrase),
             testDevice: () => testDevice(),
             exportHd: () => exportHd(),
@@ -1360,13 +1445,13 @@ function App() {
                                                 {clickPoints.filter(p => p.label === 1).length} pos · {clickPoints.filter(p => p.label === 0).length} neg
                                             </span>
                                             <button className="mask-btn" disabled={!clickPoints.length}
-                                                onClick={() => { setClickPoints([]); setStatus('Click to ADD a region · Alt+click to REMOVE · Done to finish') }}
+                                                onClick={() => { putClickPoints([]); setStatus('Click to ADD a region · Alt+click to REMOVE · Done to finish') }}
                                                 title="Clear the click markers (use ⌘/Ctrl+Z to undo individual add/remove edits)">
                                                 Clear points
                                             </button>
                                         </>
                                     )}
-                                    <button className="mask-btn" onClick={() => { setTool(null); setDraft([]); setSamBox(null); setAiLasso(null); setClickPoints([]); setClickMaskId(null); refineRef.current = null; setStatus('') }}>Done</button>
+                                    <button className="mask-btn" onClick={() => { setTool(null); setDraft([]); setSamBox(null); setAiLasso(null); putClickPoints([]); setClickMaskId(null); refineRef.current = null; setStatus('') }}>Done</button>
                                 </div>
                             )}
                         </div>
