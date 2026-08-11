@@ -96,7 +96,24 @@ export const launch = async ({ port = 9333, headless = true } = {}) => {
                 .map((a) => a.value ?? a.description ?? a.type).join(' ')
         })
 
+    /** Wait for a CDP event, including one that arrived just before this call. */
+    const waitForEvent = async (method, timeout = 30_000) => {
+        const seen = events.find((e) => e.method === method)
+        if (seen) return seen
+        const until = Date.now() + timeout
+        while (Date.now() < until) {
+            const event = events.find((e) => e.method === method)
+            if (event) return event
+            await new Promise((r) => setTimeout(r, 25))
+        }
+        throw new Error(`timed out waiting for CDP event ${method}`)
+    }
+
+    /** Events are append-only for a launch; callers can snapshot an index. */
+    const eventCount = () => events.length
+    const eventsSince = (index) => events.slice(index)
+
     const close = async () => { try { ws.close() } catch {} ; try { await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`) } catch {}; proc.kill() }
 
-    return { send, evaluate, goto, setFiles, consoleLines, close }
+    return { send, evaluate, goto, setFiles, consoleLines, waitForEvent, eventCount, eventsSince, close }
 }

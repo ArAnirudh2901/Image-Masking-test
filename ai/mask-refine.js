@@ -347,9 +347,11 @@ const gfColor = (p, R, G, B, w, h, {
         const cg = mgp[i] - mg[i] * mp[i]
         const cb = mbp[i] - mb[i] * mp[i]
 
-        const xr = (c11 * cr + c12 * cg + c13 * cb) / det
-        const xg = (c12 * cr + c22 * cg + c23 * cb) / det
-        const xb = (c13 * cr + c23 * cg + c33 * cb) / det
+        // 1 division + 3 multiplications instead of 3 divisions
+        const invDet = 1 / det
+        const xr = (c11 * cr + c12 * cg + c13 * cb) * invDet
+        const xg = (c12 * cr + c22 * cg + c23 * cb) * invDet
+        const xb = (c13 * cr + c23 * cg + c33 * cb) * invDet
         ar[i] = xr; ag[i] = xg; ab[i] = xb
         bo[i] = mp[i] - xr * mr[i] - xg * mg[i] - xb * mb[i]
     }
@@ -612,19 +614,18 @@ const refineRect = (field, rgba, w, x0, y0, rw, rh, cx0, cy0, cx1, cy1, o) => {
     const cb = o.color ? take(Float32Array, n) : null
     const cr = o.color ? take(Float32Array, n) : null
 
+    const INV255 = 1 / 255
     for (let y = 0; y < rh; y += 1) {
         const srow = (y0 + y) * w + x0
         const drow = y * rw
         sub.set(field.subarray(srow, srow + rw), drow)
         for (let x = 0; x < rw; x += 1) {
-            const j = (srow + x) * 4
-            const r = rgba[j] / 255
-            const g = rgba[j + 1] / 255
-            const b = rgba[j + 2] / 255
+            const j = (srow + x) << 2
+            const r = rgba[j] * INV255, g = rgba[j | 1] * INV255, b = rgba[j | 2] * INV255
             const Y = 0.299 * r + 0.587 * g + 0.114 * b
             gy[drow + x] = Y
             if (o.color) {
-                cb[drow + x] = 0.564 * (b - Y)   // Rec.601, ±0.5
+                cb[drow + x] = 0.564 * (b - Y)
                 cr[drow + x] = 0.713 * (r - Y)
             }
         }
@@ -669,18 +670,23 @@ export const bandAlpha = (field, w, h, band = 1.5, out = null) => {
     const dst = out || new Uint8ClampedArray(w * h * 4)
     const inv = 255 / (2 * band)
     const n = Math.min(field.length, w * h)
+    // Branchless clamp: Math.min/max compile to hardware min/max on modern V8
+    const clamp = (v) => Math.round(Math.min(255, Math.max(0, (v + band) * inv)))
     if (u32able(dst)) {
         const u32 = new Uint32Array(dst.buffer, dst.byteOffset, dst.length >> 2)
-        for (let i = 0; i < n; i += 1) {
-            const v = field[i]
-            const a = v <= -band ? 0 : (v >= band ? 255 : Math.round((v + band) * inv))
-            u32[i] = a * 0x01010101
+        // 4× unrolled for better JIT pipeline utilization
+        const n4 = n & ~3
+        for (let i = 0; i < n4; i += 4) {
+            u32[i]     = clamp(field[i])     * 0x01010101
+            u32[i + 1] = clamp(field[i + 1]) * 0x01010101
+            u32[i + 2] = clamp(field[i + 2]) * 0x01010101
+            u32[i + 3] = clamp(field[i + 3]) * 0x01010101
         }
+        for (let i = n4; i < n; i += 1) u32[i] = clamp(field[i]) * 0x01010101
         return dst
     }
     for (let i = 0, j = 0; i < n; i += 1, j += 4) {
-        const v = field[i]
-        const a = v <= -band ? 0 : (v >= band ? 255 : Math.round((v + band) * inv))
+        const a = clamp(field[i])
         dst[j] = dst[j + 1] = dst[j + 2] = dst[j + 3] = a
     }
     return dst

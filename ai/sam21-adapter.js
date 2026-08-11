@@ -219,11 +219,20 @@ const candidateInfo = () =>
 
 /**
  * Move to the next/previous candidate and re-run the post pipeline on it.
- * Synchronous on purpose — it is a repaint, and awaiting it would put it back
- * on the same footing as the decode it exists to avoid. Returns null when there
- * is nothing parked for `imageKey`, or only one distinct candidate.
+ * Async: dispatches to the mask-post worker so the ~90–134 ms of upsample +
+ * guided filter runs off the main thread. Falls back in-process when the
+ * worker is broken, same as sam21Segment.
+ *
+ * The original docblock said "synchronous on purpose — awaiting it would put
+ * it back on the same footing as the decode it exists to avoid." That
+ * reasoning predated the worker existing. Now that the worker is warm, the
+ * round-trip adds ~20 ms of latency (invisible for a ↑/↓ keypress) and
+ * removes ~130 ms of UI jank.
+ *
+ * Returns null when there is nothing parked for `imageKey`, or only one
+ * distinct candidate.
  */
-export const sam21Cycle = (delta = 1, imageKey = null) => {
+export const sam21Cycle = async (delta = 1, imageKey = null) => {
     if (!candidates || candidates.rows.length < 2) return null
     if (imageKey && candidates.imageKey !== imageKey) return null
     const t0 = performance.now()
@@ -231,7 +240,7 @@ export const sam21Cycle = (delta = 1, imageKey = null) => {
     candidates.index = (candidates.index + (delta < 0 ? n - 1 : 1)) % n
     const row = candidates.rows[candidates.index]
     const { canvas, w, h } = candidates
-    const { rgba, rawRgba } = postProcess(canvas, candidates.imageKey, row.p, w, h)
+    const { rgba, rawRgba } = await postProcessAsync(canvas, candidates.imageKey, row.p, w, h)
     return {
         rgba,
         rawRgba,

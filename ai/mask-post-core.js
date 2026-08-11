@@ -75,15 +75,20 @@ export const upsampleLogits = (logits, w, h, maskSide) => {
     for (let y = 0; y < h; y += 1) {
         const fy = (y + 0.5) * sy - 0.5
         const y0 = Math.floor(fy)
-        const k = cubic(fy - y0)
+        // Inline cubic weights — avoids allocating a 4-element array per row
+        const t = fy - y0, t2 = t * t, t3 = t2 * t
+        const k0 = -0.5 * t3 + t2 - 0.5 * t
+        const k1 =  1.5 * t3 - 2.5 * t2 + 1
+        const k2 = -1.5 * t3 + 2 * t2 + 0.5 * t
+        const k3 =  0.5 * t3 - 0.5 * t2
         const r0 = clampIdx(y0 - 1) * w
         const r1 = clampIdx(y0) * w
         const r2 = clampIdx(y0 + 1) * w
         const r3 = clampIdx(y0 + 2) * w
         const row = y * w
         for (let x = 0; x < w; x += 1) {
-            const v = tmp[r0 + x] * k[0] + tmp[r1 + x] * k[1]
-                + tmp[r2 + x] * k[2] + tmp[r3 + x] * k[3]
+            const v = tmp[r0 + x] * k0 + tmp[r1 + x] * k1
+                + tmp[r2 + x] * k2 + tmp[r3 + x] * k3
             out[row + x] = v
             if (v > -BAND && v < BAND) {
                 if (x < minX) minX = x
