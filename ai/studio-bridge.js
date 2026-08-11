@@ -32,6 +32,8 @@ import {
 import { extractRawPreview, isRawFile } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { disposeCvRefine } from './cv-refine-client.js'
+import { dropMaskPostGuide } from './mask-post-client.js'
+import { clearGuideCache } from './sam21-adapter.js'
 import { composeChannels, dilateChannel, lassoToPrompts, maskToChannel } from './sam-core.js'
 import { detectCandidates } from './text-ui.js'
 import { modelRegistry } from './model-registry.js'
@@ -263,7 +265,13 @@ export const warm = async ({ withEncoder = false } = {}) => {
 export const shed = (level, { announce = true } = {}) => {
     const previous = BUDGET.pressureLevel || 0
     BUDGET = applyMemoryPressure(BUDGET, level)
-    if ((BUDGET.pressureLevel || 0) >= 2) disposeCvRefine()
+    if ((BUDGET.pressureLevel || 0) >= 2) {
+        disposeCvRefine()
+        // Two ~7 MB guide copies exist once post runs off-thread: the worker's
+        // and the adapter's (cycling/fallback). Shed both.
+        dropMaskPostGuide()
+        clearGuideCache()
+    }
     if (level >= 1) forgetEncoder()
     if (announce && BUDGET.pressureLevel > previous) {
         emit({ type: 'pressure', level: BUDGET.pressureLevel })
