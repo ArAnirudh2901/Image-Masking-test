@@ -14,10 +14,20 @@
  * which Bun leaves alone, and serve.mjs serves `ai/*.js` as real ES modules.
  */
 import path from 'node:path'
-import { readdirSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, rmSync } from 'node:fs'
 
-const REPO = path.resolve(import.meta.dir, '../phosmith') // phosmith root
+const REPO = path.resolve(process.env.PHOSMITH_DIR || path.join(import.meta.dir, '../phosmith'))
 const SRC = path.join(REPO, 'src')
+
+// Without this, a missing sibling surfaces as eight "Cannot find module
+// './src/lib/…'" lines that never say the word phosmith.
+if (!existsSync(SRC)) {
+    console.error(`BUILD FAILED — phosmith not found at ${REPO}
+app.jsx imports the megashader engine and the editor UI from it over the @/ alias.
+  bun run setup                       clone + pin + install + weights
+  PHOSMITH_DIR=/path/to/phosmith …    if your checkout lives elsewhere`)
+    process.exit(1)
+}
 
 // Clean previous output (entry + split chunks) so stale chunks don't linger.
 for (const f of readdirSync(import.meta.dir)) {

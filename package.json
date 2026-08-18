@@ -6,11 +6,18 @@
   "private": true,
   "packageManager": "bun@1.3.11",
   "scripts": {
+    "setup": "bun scripts/setup.mjs",
+    "setup:all": "bun scripts/setup.mjs --detector",
     "build": "bun run build.mjs",
     "serve": "bun run serve.mjs",
     "dev": "bun run build.mjs && bun run serve.mjs",
     "models": "bun scripts/download-models.mjs",
     "models:all": "bun scripts/download-models.mjs --detector"
+  },
+  "phosmith": {
+    "repo": "https://github.com/ArAnirudh2901/Phosmith.git",
+    "commit": "00dd1a097ce9f9d2ca167a640a87ae0528bab087",
+    "comment": "build.mjs resolves @/ into this checkout (sibling ../phosmith, or $PHOSMITH_DIR). Bump the commit only alongside the app.jsx change that needs it."
   },
   "dependencies": {
     "react": "19.2.7",

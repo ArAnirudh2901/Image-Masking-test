@@ -166,6 +166,14 @@ const ensureBundle = async ({ asset, sha256 }, assets) => {
     )
     if (present.every(Boolean)) return true
 
+    // Before the download, not after: discovering a missing tar at extraction
+    // time throws away 108 MB of transfer. bsdtar ships with macOS, Windows 10+
+    // and every mainstream Linux, so this is a rare path, not a common one.
+    if (!(await execFileAsync('tar', ['--version']).then(() => true).catch(() => false))) {
+        log(`FAILED ${asset}: no \`tar\` on PATH — install it, then re-run`)
+        return false
+    }
+
     const url = releaseUrl(asset)
     const tmp = path.join(tmpdir(), `${asset}.${process.pid}.part`)
     log(`fetching ${asset} …`)

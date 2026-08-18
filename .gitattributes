@@ -1,0 +1,18 @@
+# Normalise to LF in the repo regardless of the checkout platform. The wasm
+# loaders and ai/*.js are served straight from disk to the browser, so a CRLF
+# checkout would ship CRLF to the page.
+* text=auto eol=lf
+
+# Never touch these — a single normalised byte breaks a wasm module or a
+# tokenizer table, and both are compared by hash elsewhere.
+*.wasm  binary
+*.onnx  binary
+*.png   binary
+*.jpg   binary
+*.webp  binary
+*.i8    binary
+*.f32   binary
+
+# Generated: keep it out of diffs and language stats.
+bun.lock       linguist-generated=true -diff
+public/wasm/*.js text eol=lf linguist-generated=true -diff
