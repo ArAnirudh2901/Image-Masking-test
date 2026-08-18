@@ -57,22 +57,64 @@ Wheels (Shadows / Midtones / Highlights) · Gamma
 
 ## 🚀 Quick start
 
-Prerequisites: [Bun](https://bun.sh) and the `phosmith/` repo checked out as a
-sibling directory (the bundler resolves `@/` → `../phosmith/src/`).
+Prerequisites: [Bun](https://bun.sh) 1.0+ and `git`. Everything else — the
+phosmith checkout, both dependency trees, the runtime and the weights — is what
+`setup` fetches.
 
 ```bash
-bun install            # React, react-dom, framer-motion
-bun run models         # one-time: vendors ~227 MB of ORT + SAM 2.1 + detector weights
+git clone https://github.com/ArAnirudh2901/Image-Masking-test.git
+cd Image-Masking-test
+bun run setup:all      # ~227 MB, one-time — or `bun run setup` for 111 MB without text search
 bun run dev            # build.mjs → app.js, then serve.mjs on :8810
 ```
 
+`setup:all` pulls the AI Text detector, and its MobileCLIP2 half is licensed for
+**non-commercial research only** — see [License](#-license). Plain `bun run
+setup` skips it.
+
 Open **http://127.0.0.1:8810**. Drop in any photo, or add a `test.png` to have
 one auto-load.
+
+`bun run setup` is idempotent — re-run it any time; anything already in place is
+skipped. It ends with a real build, so if it exits 0 the app builds.
+
+<details>
+<summary>What setup does, and doing it by hand</summary>
+
+```bash
+git clone https://github.com/ArAnirudh2901/Phosmith.git ../phosmith
+git -C ../phosmith checkout $(bun -e 'console.log(require("./package.json").phosmith.commit)')
+bun install                 # here
+bun install --cwd ../phosmith
+bun run models:all          # ORT + weights
+bun run build
+```
+
+**phosmith is a build input, not a runtime one.** `app.jsx` imports the
+megashader engine and the real editor UI (`MaskChainCard`, `LayerGradeEditor`,
+`ProRulerSlider`) over the `@/` alias, which `build.mjs` resolves into a sibling
+`../phosmith/src/`. Set `PHOSMITH_DIR` if your checkout lives elsewhere. It
+needs its own `bun install` too: `build.mjs` pins every `react` / `react-dom` /
+`scheduler` import there so exactly **one** React copy is bundled — two copies
+crash at runtime with `Cannot read properties of null (reading 'useState')`.
+
+The commit is pinned in `package.json` → `phosmith.commit`. Setup checks out the
+pin on a fresh clone (detached, on purpose) and only *warns* if an existing
+checkout differs, so it never rewrites work in progress.
+
+</details>
+
+### Where the models come from
 
 `bun run models` is what makes the app work **with no internet**. It vendors
 onnxruntime-web under `lib/` and the weights under `models/` (both gitignored).
 Skip it and the app falls back to the pinned CDN on first use, caching into
 Cache Storage via `sw.js` — which survives reloads but is evictable.
+
+The weights come from this repo's [`weights-v1`](../../releases/tag/weights-v1)
+release, SHA-256 pinned in `scripts/download-models.mjs`, so every machine runs
+the same bytes — ONNX export is not reproducible across torch versions, and the
+fp16 encoder is sensitive enough that a re-export is a different model.
 
 ### Requirements
 
@@ -80,6 +122,23 @@ Cache Storage via `sw.js` — which survives reloads but is evictable.
 fp16-only; there is no WASM fallback and no second segmentation model, because a
 second one would break the bounded interaction-memory contract. Chrome/Edge 121+
 and Safari 18+ on Apple Silicon qualify.
+
+Serving is **127.0.0.1 only**, and that is not arbitrary: the page must be
+cross-origin isolated *and* a secure context for WebGPU, threaded WASM and
+`measureUserAgentSpecificMemory()`. A plain-HTTP LAN address is neither, so the
+mask lane degrades there. To view it from another device, tunnel to
+`127.0.0.1:8810` over HTTPS rather than binding a LAN interface. `PORT=9000 bun
+run serve` moves the port.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `BUILD FAILED — phosmith not found at …` | no sibling checkout — `bun run setup`, or set `PHOSMITH_DIR` |
+| `Cannot read properties of null (reading 'useState')` | two React copies — `bun install --cwd ../phosmith` |
+| `mask lane incomplete — N core asset(s) missing` | weights never landed — re-run `bun run models` |
+| `digest mismatch for weights-*.tar.gz` | truncated download — re-run; the bad file is discarded, never extracted |
+| AI tools greyed out, "AI Text" absent | no WebGPU/`shader-f16`, or detector not installed (`bun run models:all`) |
 
 ---
 
@@ -194,10 +253,34 @@ feature request**; parameters may only ever lower a limit.
 
 | Item | Why | How to get it |
 |---|---|---|
-| `lib/ort-web/`, `models/` | ~227 MB of runtime + weights | `bun run models` |
+| `../phosmith/` | separate repo — the megashader engine + editor UI | `bun run setup` |
+| `lib/ort-web/`, `models/` | ~227 MB of runtime + weights | `bun run models:all` |
 | `app.js` | build output | `bun run build.mjs` |
 | `node_modules/` | dependencies | `bun install` |
 | `test.png` | large sample image | drop in any photo |
+| `bench/corpus/` | ~200 MB of camera files | `bun bench/make-corpus.mjs` |
+
+## 📄 License
+
+**GNU AGPL v3 or later** — see [LICENSE](LICENSE). Copyright © 2026 Anirudh
+Aravalli. Fork it, modify it, run it; if you host a modified version for other
+people, they get its source too. The top bar carries the [§13](LICENSE) source
+link that satisfies that.
+
+AGPL is not a preference here, it is inherited: the open-vocab detector behind
+**AI Text** derives from YOLOE, which is AGPL-3.0. Ultralytics sells a
+[commercial license](https://www.ultralytics.com/license) for anyone who cannot
+comply.
+
+**One restriction is not ours to grant.** The MobileCLIP2 text tower —
+`models/clip-text/`, shipped in `weights-detector.tar.gz` — is under Apple's
+[Machine Learning Research Model TOU](LICENSE-MODELS-Apple.txt): **non-commercial
+research use only**. `bun run setup` (without `:all`) skips it and loses only AI
+Text. Everything else — SAM 2.1 (Apache-2.0), ONNX Runtime (MIT), LibRaw
+(LGPL-2.1 / CDDL-1.0) — is unrestricted.
+
+[NOTICE](NOTICE) has every component, its license, and exactly what was changed
+to produce the shipped artifact. Read it before you redistribute.
 
 ## 🔗 Related
 

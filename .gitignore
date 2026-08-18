@@ -11,8 +11,11 @@ chunk-*.js.map
 # ~227 MB. Produced by scripts/download-models.mjs; never committed. Without
 # them the app falls back to the pinned CDN on first use.
 lib/ort-web/
-models/*/
-!models/manifest.json
+models/
+# Local, not shipped: it records THIS machine's file sizes and a timestamp, and
+# nothing fetches it at runtime — download-models.mjs is its only reader (its
+# idempotency check). Tracking it made every clone dirty after setup.
+models/manifest.json
 
 # Retired: the old transformers.js path pointed onnxruntime-web here.
 ort/
