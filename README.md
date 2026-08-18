@@ -68,6 +68,10 @@ bun run setup:all      # ~227 MB, one-time — or `bun run setup` for 111 MB wit
 bun run dev            # build.mjs → app.js, then serve.mjs on :8810
 ```
 
+`setup:all` pulls the AI Text detector, and its MobileCLIP2 half is licensed for
+**non-commercial research only** — see [License](#-license). Plain `bun run
+setup` skips it.
+
 Open **http://127.0.0.1:8810**. Drop in any photo, or add a `test.png` to have
 one auto-load.
 
@@ -255,6 +259,28 @@ feature request**; parameters may only ever lower a limit.
 | `node_modules/` | dependencies | `bun install` |
 | `test.png` | large sample image | drop in any photo |
 | `bench/corpus/` | ~200 MB of camera files | `bun bench/make-corpus.mjs` |
+
+## 📄 License
+
+**GNU AGPL v3 or later** — see [LICENSE](LICENSE). Copyright © 2026 Anirudh
+Aravalli. Fork it, modify it, run it; if you host a modified version for other
+people, they get its source too. The top bar carries the [§13](LICENSE) source
+link that satisfies that.
+
+AGPL is not a preference here, it is inherited: the open-vocab detector behind
+**AI Text** derives from YOLOE, which is AGPL-3.0. Ultralytics sells a
+[commercial license](https://www.ultralytics.com/license) for anyone who cannot
+comply.
+
+**One restriction is not ours to grant.** The MobileCLIP2 text tower —
+`models/clip-text/`, shipped in `weights-detector.tar.gz` — is under Apple's
+[Machine Learning Research Model TOU](LICENSE-MODELS-Apple.txt): **non-commercial
+research use only**. `bun run setup` (without `:all`) skips it and loses only AI
+Text. Everything else — SAM 2.1 (Apache-2.0), ONNX Runtime (MIT), LibRaw
+(LGPL-2.1 / CDDL-1.0) — is unrestricted.
+
+[NOTICE](NOTICE) has every component, its license, and exactly what was changed
+to produce the shipped artifact. Read it before you redistribute.
 
 ## 🔗 Related
 

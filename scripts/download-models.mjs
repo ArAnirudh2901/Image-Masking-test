@@ -242,6 +242,16 @@ let detectorReady = false
 if (withDetector) {
     await ensureBundle(WEIGHT_BUNDLES.detector, DETECTOR_ASSETS)
     detectorReady = (await verifyBuilt(DETECTOR_ASSETS, files)).length === 0
+    // Apple's Machine Learning Research Model TOU requires this notice travel
+    // with the weights, so it is printed where they actually land rather than
+    // only in NOTICE.
+    if (detectorReady) {
+        log('detector installed — two licenses ride along:')
+        log('  YOLOE (models/yoloe/) is AGPL-3.0 — https://www.ultralytics.com/license')
+        log('  MobileCLIP2 (models/clip-text/) is "licensed under the Apple Machine')
+        log('  Learning Research Model License Agreement" — RESEARCH USE ONLY, no')
+        log('  commercial use. Full terms: LICENSE-MODELS-Apple.txt')
+    }
 }
 
 const manifest = {

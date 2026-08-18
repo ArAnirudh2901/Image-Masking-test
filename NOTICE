@@ -1,0 +1,146 @@
+Mask Studio
+Copyright (C) 2026 Anirudh Aravalli
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full text is in LICENSE.
+
+
+================================================================================
+WHY AGPL-3.0
+================================================================================
+
+The open-vocabulary detector behind the "AI Text" tool is derived from YOLOE,
+which is AGPL-3.0. Weights derived from an AGPL work carry that license into
+whatever ships them, so the whole project is AGPL-3.0. Building without the
+detector (`bun run setup`, no `--detector`) drops that dependency, but the
+project's own license does not change.
+
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+Nothing below is covered by this project's AGPL-3.0 grant. Each keeps the
+license its upstream gave it.
+
+--------------------------------------------------------------------------------
+SAM 2.1 (Segment Anything Model 2.1), small — Meta Platforms, Inc.
+    Apache License 2.0
+    https://github.com/facebookresearch/sam2
+
+    Ships as: models/sam21/encoder.fp16.onnx
+              models/sam21/decoder.fp16.onnx
+              models/sam21/model.json
+
+    Modified: the PyTorch checkpoint is traced to ONNX and cast to fp16. The
+    image encoder and the mask decoder are exported as two separate graphs so
+    the expensive encode can be cached per image and the decoder re-run per
+    click. Weight values are otherwise unchanged. Rebuild with
+    `python3 scripts/export-sam21.py`.
+
+--------------------------------------------------------------------------------
+YOLOE (Real-Time Seeing Anything), 26L text-prompt variant — THU-MIG,
+    distributed through Ultralytics
+    GNU Affero General Public License v3.0
+    https://github.com/THU-MIG/yoloe
+    https://github.com/ultralytics/ultralytics
+
+    Ships as: models/yoloe/yoloe-26l-text.fp16.onnx
+
+    Modified: exported to ONNX in fp16 with the RepRTA text-prompt head kept
+    live, so class embeddings can be supplied at inference time instead of
+    being baked in. Rebuild with `python3 scripts/export-yoloe-text.py`.
+
+    Ultralytics also sells a commercial license for anyone who cannot comply
+    with AGPL-3.0: https://www.ultralytics.com/license
+
+--------------------------------------------------------------------------------
+MobileCLIP2-B text tower — Apple Inc.
+    Code:   MIT License
+    Models: Apple Machine Learning Research Model Terms of Use
+            *** RESEARCH USE ONLY — NOT FOR COMMERCIAL USE ***
+    https://github.com/apple/ml-mobileclip
+
+    "Apple Machine Learning Research Model is licensed under the Apple Machine
+    Learning Research Model License Agreement."
+
+    The full agreement is in LICENSE-MODELS-Apple.txt, reproduced here as that
+    agreement requires. Read it before redistributing this project or the
+    `weights-detector.tar.gz` release asset. In short: Apple grants a
+    royalty-free, revocable license to use, modify, distribute and derive from
+    the model *exclusively for non-commercial scientific research and academic
+    development*. It does not permit commercial exploitation, product
+    development, or use in any commercial product or service. That restriction
+    is Apple's, it sits outside AGPL-3.0, and this project cannot waive it.
+
+    Ships as: models/clip-text/mclip2-text.q4.onnx
+              models/clip-text/mclip2-embed.i8
+              models/clip-text/mclip2-embed.scale.f32
+              models/clip-text/merges.txt
+
+    Modified — disclosed as the agreement requires for Model Derivatives:
+      * the text tower is exported to ONNX and quantized to int4 (q4)
+      * the token embedding table is exported separately as int8 (.i8) with a
+        per-tensor float32 scale (.scale.f32), so it can be indexed on the CPU
+        without materialising the fp32 table
+      * only the text tower is shipped; the image tower is not used or included
+      * the BPE merges table is copied verbatim
+    Rebuild with `python3 scripts/export-clip-text.py`.
+
+    The text tower must stay the MobileCLIP2-B one YOLOE-26L was trained
+    against — a different CLIP produces out-of-distribution vectors and RepRTA
+    silently degrades.
+
+--------------------------------------------------------------------------------
+LibRaw — LibRaw LLC
+    Dual-licensed: LGPL-2.1 **or** CDDL-1.0, at your choice
+    https://github.com/LibRaw/LibRaw
+
+    Ships as: public/wasm/raw-develop.wasm, public/wasm/raw-develop.js
+    (compiled to WebAssembly; used only for on-device camera RAW develop)
+
+    LibRaw includes code from dcraw.c, copyright 1997-2018 Dave Coffin, and DCB
+    demosaic / FBDD denoise, copyright 2010 Jacek Gozdz, under a 3-clause
+    BSD-like license. No RESTRICTED dcraw code is used.
+
+    LGPL-2.1 §6 requires that recipients be able to relink this project against
+    a modified LibRaw. Ask via the repository issue tracker for the exact
+    upstream revision and Emscripten flags used to produce raw-develop.wasm, or
+    take LibRaw's own source from the URL above — the wasm module is a plain
+    Emscripten build with no LibRaw source changes.
+
+--------------------------------------------------------------------------------
+ONNX Runtime Web — Microsoft Corporation
+    MIT License
+    https://github.com/microsoft/onnxruntime
+
+    Vendored under lib/ort-web/ by `bun run models` (not committed).
+
+    Modified: one patch to the bundled ESM build passes `epConfig` through to
+    the WebGPU execution provider so the buffer cache's `lazyRelease` mode can
+    be set. `scripts/download-models.mjs` applies it and asserts it landed.
+
+--------------------------------------------------------------------------------
+React, React DOM — Meta Platforms, Inc.      MIT License
+Framer Motion — Framer B.V.                  MIT License
+
+    Bundled into app.js. See node_modules/<package>/LICENSE for full text.
+
+--------------------------------------------------------------------------------
+phosmith — the megashader engine and editor UI
+    GNU Affero General Public License v3.0
+    https://github.com/ArAnirudh2901/Phosmith
+
+    A build-time input, not a runtime one: build.mjs resolves the `@/` alias
+    into a sibling checkout and bundles the imported modules into app.js.

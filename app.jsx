@@ -14,6 +14,11 @@
  * Everything runs in the browser. There is no upload endpoint, no Python
  * service and no CDN model fetch on the vendored path — see `ai/studio-bridge.js`
  * for the whole surface this file is allowed to touch.
+ *
+ * Copyright (C) 2026 Anirudh Aravalli
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ * See LICENSE for the full text; third-party terms, including the
+ * research-only Apple model license, are in NOTICE.
  */
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -36,6 +41,11 @@ import { rgbToHsb } from '@/lib/color-utils'
 
 const ACCENT = '#53d8ff'
 const uid = () => Math.random().toString(36).slice(2, 9)
+
+// Where the corresponding source lives, for the AGPL-3.0 §13 offer in the top
+// bar. Point this at YOUR fork if you deploy a modified build — §13 asks for the
+// source of the running version, not of upstream.
+const SOURCE_URL = 'https://github.com/ArAnirudh2901/Image-Masking-test'
 
 /**
  * The seglab engine, loaded through a RUNTIME import so Bun leaves it alone.
@@ -1405,6 +1415,10 @@ function App() {
                 <label className="mask-toggle"><input type="checkbox" checked={overlayMode} onChange={(e) => setOverlayMode(e.target.checked)} /> Show mask overlay</label>
                 <label className="mask-toggle"><input type="checkbox" checked={globalInvert} onChange={(e) => setGlobalInvert(e.target.checked)} /> Invert all</label>
                 <span className="hint">{status}</span>
+                {/* AGPL-3.0 §13: whoever interacts with this over a network has to be
+                    offered the corresponding source, so the offer lives in the UI. */}
+                <a className="src-link" href={SOURCE_URL} target="_blank" rel="noreferrer"
+                    title="Mask Studio is free software under the GNU AGPL v3 — get the source">Source</a>
             </div>
 
             <div className="studio-main">
