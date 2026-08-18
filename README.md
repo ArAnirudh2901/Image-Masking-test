@@ -62,7 +62,8 @@ sibling directory (the bundler resolves `@/` → `../phosmith/src/`).
 
 ```bash
 bun install            # React, react-dom, framer-motion
-bun run models         # one-time: vendors ~227 MB of ORT + SAM 2.1 + detector weights
+bun run models         # one-time: ~111 MB — ORT + SAM 2.1 (everything but text search)
+bun run models:all     # ~227 MB — the above plus the open-vocab detector
 bun run dev            # build.mjs → app.js, then serve.mjs on :8810
 ```
 
@@ -73,6 +74,12 @@ one auto-load.
 onnxruntime-web under `lib/` and the weights under `models/` (both gitignored).
 Skip it and the app falls back to the pinned CDN on first use, caching into
 Cache Storage via `sw.js` — which survives reloads but is evictable.
+
+The weights come from this repo's [`weights-v1`](../../releases/tag/weights-v1)
+release, SHA-256 pinned in `scripts/download-models.mjs`, so every machine runs
+the same bytes — ONNX export is not reproducible across torch versions, and the
+fp16 encoder is sensitive enough that a re-export is a different model. The
+script is idempotent; re-running it costs nothing once the files are in place.
 
 ### Requirements
 
@@ -194,7 +201,7 @@ feature request**; parameters may only ever lower a limit.
 
 | Item | Why | How to get it |
 |---|---|---|
-| `lib/ort-web/`, `models/` | ~227 MB of runtime + weights | `bun run models` |
+| `lib/ort-web/`, `models/` | ~227 MB of runtime + weights | `bun run models:all` |
 | `app.js` | build output | `bun run build.mjs` |
 | `node_modules/` | dependencies | `bun install` |
 | `test.png` | large sample image | drop in any photo |

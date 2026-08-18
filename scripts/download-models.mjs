@@ -2,24 +2,39 @@
 /**
  * Vendors every runtime asset SEGLAB needs, so the app serves fully offline:
  *   lib/ort-web/…              — onnxruntime-web (WebGPU ESM bundle + wasm loader)
+ *   models/sam21/…             — SAM 2.1 small, fp16 (core)
+ *   models/yoloe/…, clip-text/ — open-vocab text search (--detector)
  *   models/manifest.json       — presence signal read at runtime
  *
- * Everything else is BUILT, not fetched — no hub publishes the exact artifacts
- * this app runs — so this script verifies those exist and names the script that
- * produces each one.
+ * No hub publishes the exact ONNX artifacts this app runs, so the weights come
+ * from this repo's own `weights-v1` release rather than being rebuilt: ONNX
+ * export is not byte-reproducible across torch/onnx versions, and the encoder
+ * is fp16-sensitive enough that a re-export is a different model in practice.
+ * Each bundle is SHA-256 pinned. The export scripts remain the source of truth
+ * for producing a NEW release, not for reproducing this one.
  *
- * lib/ and models/ are gitignored (~25 MB fetched, ~92 MB built core).
+ * lib/ and models/ are gitignored (~25 MB runtime, ~197 MB weights).
  * Idempotent: complete files are skipped.
  *
- * Usage: node scripts/download-models.mjs [--detector]
+ * Usage: bun run models          (core)
+ *        bun run models:all      (core + detector)
  *
  *   (core)       click/box/lasso selection + export run with no network.
- *   --detector   also registers the open-vocabulary text-search artifacts.
+ *   --detector   also fetches the open-vocabulary text-search artifacts.
  */
 
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { createWriteStream } from 'node:fs'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -60,6 +75,24 @@ const DETECTOR_ASSETS = [
     ['models/clip-text/mclip2-embed.scale.f32', 'python3 scripts/export-clip-text.py'],
     ['models/clip-text/merges.txt', 'python3 scripts/export-clip-text.py'],
 ]
+
+// Prebuilt weights, published from a machine that had the export toolchain.
+// Bumping a bundle means a new tag + new digest — never overwrite an asset in
+// place, or pinned checkouts silently change models.
+const WEIGHTS_TAG = 'weights-v1'
+const releaseUrl = (name) =>
+    `https://github.com/ArAnirudh2901/Image-Masking-test/releases/download/${WEIGHTS_TAG}/${name}`
+
+const WEIGHT_BUNDLES = {
+    core: {
+        asset: 'weights-core.tar.gz',
+        sha256: 'fce3b92db7e1eb915291d92da2d104a03952ff7bcde779e584cb085e552e1f4b',
+    },
+    detector: {
+        asset: 'weights-detector.tar.gz',
+        sha256: '58bedb872662f244eacb67f88208937c8e0a3bf1adebd837764fa3925aa52115',
+    },
+}
 
 const withDetector = process.argv.includes('--detector')
 
@@ -123,8 +156,47 @@ const download = async ({ url, dest, optional }) => {
     return { path: dest, bytes: buf.length }
 }
 
-/** Verify built assets rather than fetching them, and say exactly how to
- *  produce a missing one instead of failing with a bare path. */
+/** Fetch + extract a weight bundle if any of its assets are absent. Streams to
+ *  a temp file: the detector bundle is 113 MB and buffering it costs more RAM
+ *  than the app is allowed at runtime. Digest is checked before extraction, so
+ *  a truncated or swapped asset never lands in models/. */
+const ensureBundle = async ({ asset, sha256 }, assets) => {
+    const present = await Promise.all(
+        assets.map(([rel]) => stat(path.join(ROOT, rel)).then((s) => !!s.size).catch(() => false)),
+    )
+    if (present.every(Boolean)) return true
+
+    const url = releaseUrl(asset)
+    const tmp = path.join(tmpdir(), `${asset}.${process.pid}.part`)
+    log(`fetching ${asset} …`)
+    try {
+        const res = await fetch(url)
+        if (!res.ok) throw new Error(`GET failed for ${url} (HTTP ${res.status})`)
+        const hash = createHash('sha256')
+        let bytes = 0
+        await pipeline(
+            Readable.fromWeb(res.body),
+            async function* (source) {
+                for await (const chunk of source) { hash.update(chunk); bytes += chunk.length; yield chunk }
+            },
+            createWriteStream(tmp),
+        )
+        const got = hash.digest('hex')
+        if (got !== sha256) throw new Error(`digest mismatch for ${asset}\n  expected ${sha256}\n  got      ${got}`)
+        // Bundles expand to models/…, so ROOT is the extraction point.
+        await execFileAsync('tar', ['-xzf', tmp, '-C', ROOT])
+        log(`got  ${asset} (${mb(bytes)}) — extracted`)
+        return true
+    } catch (err) {
+        log(`FAILED ${asset}: ${err.message}`)
+        return false
+    } finally {
+        await rm(tmp, { force: true })
+    }
+}
+
+/** Confirm each asset landed, and say exactly how to produce a missing one
+ *  instead of failing with a bare path. */
 const verifyBuilt = async (assets, files) => {
     const missing = []
     for (const [rel, how] of assets) {
@@ -132,7 +204,7 @@ const verifyBuilt = async (assets, files) => {
         if (local?.size) { log(`have ${rel} (${mb(local.size)})`); files.push({ path: rel, bytes: local.size }) }
         else missing.push([rel, how])
     }
-    for (const [rel, how] of missing) log(`MISSING ${rel} — build it with: ${how}`)
+    for (const [rel, how] of missing) log(`MISSING ${rel} — re-run, or rebuild it with: ${how}`)
     return missing
 }
 
@@ -155,9 +227,14 @@ for (const job of jobs) {
     }
 }
 
+await ensureBundle(WEIGHT_BUNDLES.core, CORE_ASSETS)
 const missingCore = await verifyBuilt(CORE_ASSETS, files)
+
 let detectorReady = false
-if (withDetector) detectorReady = (await verifyBuilt(DETECTOR_ASSETS, files)).length === 0
+if (withDetector) {
+    await ensureBundle(WEIGHT_BUNDLES.detector, DETECTOR_ASSETS)
+    detectorReady = (await verifyBuilt(DETECTOR_ASSETS, files)).length === 0
+}
 
 const manifest = {
     onnxruntimeWeb: ORT_WEB_VERSION,
@@ -171,7 +248,7 @@ await mkdir(path.join(ROOT, 'models'), { recursive: true })
 await writeFile(path.join(ROOT, 'models', 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 const total = files.reduce((sum, f) => sum + f.bytes, 0)
 log(`done — ${files.length} files, ${mb(total)} total; wrote models/manifest.json`)
-if (!withDetector) log('open-vocab text search not registered — re-run with --detector once the export scripts have run')
+if (!withDetector) log('open-vocab text search not registered — run `bun run models:all` to fetch it')
 // Loud, and last, so it is the thing left on screen: the app cannot segment
 // without these, and a silent manifest would let that surface as a runtime bug.
 if (missingCore.length) {

@@ -9,8 +9,8 @@
     "build": "bun run build.mjs",
     "serve": "bun run serve.mjs",
     "dev": "bun run build.mjs && bun run serve.mjs",
-    "models": "node scripts/download-models.mjs",
-    "models:all": "node scripts/download-models.mjs --detector"
+    "models": "bun scripts/download-models.mjs",
+    "models:all": "bun scripts/download-models.mjs --detector"
   },
   "dependencies": {
     "react": "19.2.7",
