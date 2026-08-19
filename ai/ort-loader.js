@@ -46,7 +46,9 @@ export const autoThreads = () => (globalThis.crossOriginIsolated
  * keeps more than the isolated lane because the RAW decode, display frame and
  * proxy are live alongside the encoder.
  *
- * MASK LANE ONLY. Measured on the detector/text worker it goes the other way —
+ * MASK LANE ONLY, and it must stay that way if another lane is ever added:
+ * measured on the short-lived worker of the (since removed) text lane it went
+ * the other way —
  * that lane builds, runs once and terminates per phrase, so the churn costs more
  * in renderer staging than the cache retains: worker renderer 1945/1957/2138 MB
  * on Bucket vs 2930/2775/2782 MB on lazyRelease, over three runs each. One long

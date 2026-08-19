@@ -19,7 +19,6 @@
  *   5. bun run build                            — the real proof it works
  *
  * Usage: bun run setup           core weights (~111 MB)
- *        bun run setup:all       + open-vocab detector (~227 MB)
  *
  *   PHOSMITH_DIR=/path/to/phosmith   use a checkout that is not ../phosmith
  *   --skip-models                    wiring only, no download
@@ -56,7 +55,6 @@ const capture = (cmd, args, cwd = ROOT) =>
 const exists = (p) => stat(p).then(() => true).catch(() => false)
 
 const args = process.argv.slice(2)
-const withDetector = args.includes('--detector') || args.includes('--all')
 const skipModels = args.includes('--skip-models')
 
 const pkg = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'))
@@ -107,7 +105,7 @@ if ((await run('bun', ['install'], { cwd: PHOSMITH })) !== 0) die('bun install i
 if (skipModels) {
     log('skipping model download (--skip-models)')
 } else {
-    const modelArgs = ['scripts/download-models.mjs', ...(withDetector ? ['--detector'] : [])]
+    const modelArgs = ['scripts/download-models.mjs']
     if ((await run('bun', modelArgs)) !== 0) die('model download failed — re-run `bun run models`')
 }
 
@@ -134,6 +132,4 @@ console.log(`
 
 Needs WebGPU with shader-f16 — Chrome/Edge 121+, or Safari 18+ on Apple
 Silicon. The mask lane is fp16-only; there is no WASM fallback.
-Drop any photo into the page, or add a test.png here to have one auto-load.${
-    withDetector ? '' : '\n\nAI Text search is not installed — `bun run models:all` adds it (~116 MB).'
-}`)
+Drop any photo into the page, or add a test.png here to have one auto-load.`)

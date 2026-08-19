@@ -60,7 +60,10 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     // Deliberately NOT timeouts: an encode waits 10 minutes, so retrying one
     // buys a 20-minute hang. A dead host is caught in 2 s by the client's ping
     // probe and reported as "host restarting", which is in this set.
-    const RECOVERABLE = /no embedding|host restarting|device|out of memory|failed to allocate|createbuffer/i
+    // `device` alone matched any message merely CONTAINING the word — including
+    // programming errors like a TypeError naming a `device` property, which were
+    // then retried and reported as 'encode failed' instead of surfacing as bugs.
+    const RECOVERABLE = /no embedding|host restarting|device lost|lost device|no webgpu device|out of memory|failed to allocate|createbuffer/i
 
     const encodeOnce = async () => {
         const bitmap = await createImageBitmap(canvas)
