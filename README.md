@@ -33,7 +33,6 @@ at all. Images, masks and every inference stay on the device.
 | **AI Click-Select** | Click any object; click again to **add**, Alt+click to **remove** |
 | **AI Box-Select** | Drag a box around an object |
 | **AI Lasso** | Draw a rough loop — it snaps to the object and can never bleed outside it |
-| **AI Text** | Describe an object ("the red car"); an on-device open-vocab detector finds every instance and SAM segments them |
 
 Every AI mask is an ordinary mask afterwards: grade it, invert it, grow/shrink
 its **Boundary**, or **Brush-refine** its coverage by hand.
@@ -64,13 +63,9 @@ phosmith checkout, both dependency trees, the runtime and the weights — is wha
 ```bash
 git clone https://github.com/ArAnirudh2901/Image-Masking-test.git
 cd Image-Masking-test
-bun run setup:all      # ~227 MB, one-time — or `bun run setup` for 111 MB without text search
+bun run setup          # ~111 MB, one-time
 bun run dev            # build.mjs → app.js, then serve.mjs on :8810
 ```
-
-`setup:all` pulls the AI Text detector, and its MobileCLIP2 half is licensed for
-**non-commercial research only** — see [License](#-license). Plain `bun run
-setup` skips it.
 
 Open **http://127.0.0.1:8810**. Drop in any photo, or add a `test.png` to have
 one auto-load.
@@ -86,7 +81,7 @@ git clone https://github.com/ArAnirudh2901/Phosmith.git ../phosmith
 git -C ../phosmith checkout $(bun -e 'console.log(require("./package.json").phosmith.commit)')
 bun install                 # here
 bun install --cwd ../phosmith
-bun run models:all          # ORT + weights
+bun run models              # ORT + weights
 bun run build
 ```
 
@@ -138,7 +133,7 @@ run serve` moves the port.
 | `Cannot read properties of null (reading 'useState')` | two React copies — `bun install --cwd ../phosmith` |
 | `mask lane incomplete — N core asset(s) missing` | weights never landed — re-run `bun run models` |
 | `digest mismatch for weights-*.tar.gz` | truncated download — re-run; the bad file is discarded, never extracted |
-| AI tools greyed out, "AI Text" absent | no WebGPU/`shader-f16`, or detector not installed (`bun run models:all`) |
+| AI tools greyed out | no WebGPU/`shader-f16` — the mask lane is fp16-only, there is no WASM fallback |
 
 ---
 
@@ -174,7 +169,7 @@ alone, and `serve.mjs` serves `ai/*.js` as real ES modules. `index.html`
 ## ⚡ Why it stays smooth
 
 - **One heavy job at a time** (`ai/heavy-job-queue.js`) — proxy decode, model
-  warm, encode, detector runs, wasm refinement and export re-decodes are
+  warm, encode, wasm refinement and export re-decodes are
   serialised at concurrency 1, so their peak allocations can never stack.
   Import outranks model work; user interaction outranks speculative prewarm; a
   new image invalidates stale queued jobs.
@@ -193,7 +188,7 @@ alone, and `serve.mjs` serves `ai/*.js` as real ES modules. `index.html`
   WASM and `measureUserAgentSpecificMemory()` — the only real byte signal the
   governor has. Everything is vendored, so isolation costs nothing.
 - **A live memory governor** (`ai/memory-governor.js`) watches measured bytes,
-  an allocation ledger and timer drift, and sheds — detector → refine →
+  an allocation ledger and timer drift, and sheds — refine →
   embedding → sessions — the moment real pressure appears. It is a one-way
   ratchet; it never re-enables a feature behind your back.
 - **Idle hibernate.** The resident cost between edits is the ORT session arena,
@@ -216,9 +211,8 @@ Image-Masking-test/
 │   ├── decode-{client,core,worker}.js · image-io.js · image-raw.js · raw-develop-*.js
 │   ├── asset-store.js · export-hd.js · proxy-plan.js
 │   ├── policy.js · capability.js · memory-governor.js · heavy-job-queue.js
-│   └── text-*.js · yoloe-detect.js · clip-tokenizer.js · detect-worker.js
 ├── lib/ort-web/      # vendored onnxruntime-web  (bun run models)
-├── models/           # SAM 2.1 + CLIP text + YOLOE weights  (bun run models)
+├── models/           # SAM 2.1 weights  (bun run models)
 ├── public/wasm/      # cv-refine + LibRaw develop, compiled from C++
 ├── sw.js             # model cache + CORP re-tag for the CDN fallback
 ├── build.mjs · serve.mjs · styles.css · index.html
@@ -232,7 +226,7 @@ bun run build.mjs   # rebuild app.js after editing app.jsx / styles.css
 ```
 
 `window.__studio` exposes every action for scripted testing: `clickSelect`,
-`samBox`, `aiLasso`, `runSubject`, `background`, `findText`, `exportHd`,
+`samBox`, `aiLasso`, `runSubject`, `background`, `exportHd`,
 `engine()`, `budget()`, `shed(level)`, `undo`, `redo`, `pixels()`.
 
 ### URL parameters
@@ -254,7 +248,7 @@ feature request**; parameters may only ever lower a limit.
 | Item | Why | How to get it |
 |---|---|---|
 | `../phosmith/` | separate repo — the megashader engine + editor UI | `bun run setup` |
-| `lib/ort-web/`, `models/` | ~227 MB of runtime + weights | `bun run models:all` |
+| `lib/ort-web/`, `models/` | ~111 MB of runtime + weights | `bun run models` |
 | `app.js` | build output | `bun run build.mjs` |
 | `node_modules/` | dependencies | `bun install` |
 | `test.png` | large sample image | drop in any photo |
@@ -267,17 +261,17 @@ Aravalli. Fork it, modify it, run it; if you host a modified version for other
 people, they get its source too. The top bar carries the [§13](LICENSE) source
 link that satisfies that.
 
-AGPL is not a preference here, it is inherited: the open-vocab detector behind
-**AI Text** derives from YOLOE, which is AGPL-3.0. Ultralytics sells a
-[commercial license](https://www.ultralytics.com/license) for anyone who cannot
-comply.
+AGPL was **inherited, not chosen**: it came from YOLOE (AGPL-3.0), the
+open-vocab detector behind the old AI Text lane. That lane has been removed, and
+with it both of the restrictions it carried — YOLOE's copyleft and the Apple
+[Machine Learning Research Model TOU](https://github.com/apple/ml-mobileclip)
+**non-commercial research only** clause that governed the MobileCLIP2 text
+tower. Nothing shipped today is bound by either.
 
-**One restriction is not ours to grant.** The MobileCLIP2 text tower —
-`models/clip-text/`, shipped in `weights-detector.tar.gz` — is under Apple's
-[Machine Learning Research Model TOU](LICENSE-MODELS-Apple.txt): **non-commercial
-research use only**. `bun run setup` (without `:all`) skips it and loses only AI
-Text. Everything else — SAM 2.1 (Apache-2.0), ONNX Runtime (MIT), LibRaw
-(LGPL-2.1 / CDDL-1.0) — is unrestricted.
+Every remaining component is permissive: SAM 2.1 (Apache-2.0), ONNX Runtime
+(MIT), LibRaw (LGPL-2.1 / CDDL-1.0). The repo stays AGPL-3.0 until its owner
+decides otherwise — that relicensing call is Anirudh's to make, not something
+this change presumes.
 
 [NOTICE](NOTICE) has every component, its license, and exactly what was changed
 to produce the shipped artifact. Read it before you redistribute.

@@ -19,7 +19,7 @@
  */
 
 import { applyMemoryPressure, resolveBudget } from './policy.js'
-import { probeCapability, probeTextLane } from './capability.js'
+import { probeCapability } from './capability.js'
 import { createMemoryGovernor } from './memory-governor.js'
 import { clearHeavyQueue, getHeavyQueueState } from './heavy-job-queue.js'
 import {
@@ -35,7 +35,6 @@ import { disposeCvRefine } from './cv-refine-client.js'
 import { dropMaskPostGuide } from './mask-post-client.js'
 import { clearGuideCache } from './sam21-adapter.js'
 import { composeChannels, dilateChannel, lassoToPrompts, maskToChannel } from './sam-core.js'
-import { detectCandidates } from './text-ui.js'
 import { modelRegistry } from './model-registry.js'
 
 const trace = (event, detail) => console.log(`[studio][ai] ${event}`, detail ?? '')
@@ -56,7 +55,6 @@ const state = {
     hasImage: false,
     proxyCanvas: null,
     lastPrompts: null,   // proxy-space prompts behind the live mask (HD export)
-    textLane: probeTextLane(),
 }
 
 /** Subscribe to engine events: {type:'progress'|'state'|'waiting'|'pressure'}. */
@@ -82,7 +80,6 @@ export const status = () => ({
     pressure: BUDGET.pressureLevel || 0,
     proxyMax: BUDGET.proxyMax,
     gpuTier: capability?.gpuTier || 'unknown',
-    textLane: state.textLane.ok,
     queue: getHeavyQueueState(),
     models: modelRegistry(),
 })
@@ -470,42 +467,6 @@ export const selectSubject = async (canvas) => {
         if (!best || rank > best.rank) best = Object.assign(r, { rank, probe: probe.name })
     }
     return best || { stale: false, usable: false, reason: 'no subject stood out — try Click-Select or Box-Select' }
-}
-
-/**
- * Open-vocabulary text selection, fully on-device: the detector (Grounding-DINO
- * class YOLOE head + CLIP text tower) localises the phrase, then every box it
- * returns is segmented by the same SAM lane and unioned into one mask. The
- * detector is disposed on the budget's schedule — its ORT arena only grows, so
- * terminating its worker is the only true free.
- */
-export const selectText = async (canvas, phrase) => {
-    if (!state.textLane.ok) return { stale: false, usable: false, reason: 'text selection is disabled (?text=0)' }
-    const found = await detectCandidates(phrase, {
-        budget: BUDGET,
-        idleMs: BUDGET.detectorDispose === 'idle' ? (BUDGET.detectorIdleMs || 0) : 0,
-        evict: !!BUDGET.detectorEvictOnEncode,
-    })
-    if (!found || !found.candidates?.length) {
-        return { stale: false, usable: false, reason: `nothing in this photo matched “${phrase}”` }
-    }
-    const rev = state.revision
-    let union = null
-    let last = null
-    let hits = 0
-    for (const candidate of found.candidates) {
-        const r = await select(canvas, { box: candidate.box })
-        if (r.stale || rev !== state.revision) return { stale: true }
-        if (!r.usable) continue
-        hits += 1
-        last = r
-        union = union
-            ? unionInto(union, r.imageData)
-            : new ImageData(new Uint8ClampedArray(r.imageData.data), r.imageData.width, r.imageData.height)
-    }
-    if (!union) return { stale: false, usable: false, reason: `“${phrase}” was found but could not be segmented` }
-    state.lastPrompts = { clicks: [], box: found.candidates[0].box, clampPoly: null, clampMargin: 0 }
-    return finish(last, union, { matches: hits, backend: found.backend, display: found.display })
 }
 
 /** Proxy-space prompts behind the live mask — what export-hd maps to the crop. */

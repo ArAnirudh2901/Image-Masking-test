@@ -244,7 +244,6 @@ function App() {
     // lags a render behind, so two clicks inside one frame both read false and
     // launch. Guards must test this ref; `ai.busy` is for display only.
     const aiBusyRef = useRef(false)
-    const [aiPhrase, setAiPhrase] = useState('')
     const [aiLasso, setAiLasso] = useState(null)   // in-progress AI-lasso stroke (image px)
 
     const bump = () => setTick((t) => t + 1)
@@ -917,18 +916,6 @@ function App() {
         aiSet({ status: `${noun} masked — SAM 2.1 (${res.probe}, ${(res.coverage * 100).toFixed(0)}% coverage, ${res.ms} ms)${invert ? ' → inverted = the entire sky / background' : ''}` })
     }, [runAi, commitAiMask, aiSet])
 
-    // AI Text — open-vocabulary, on-device: the detector localises the phrase,
-    // then SAM segments every box it returns and the masks union into one layer.
-    const runText = useCallback(async (phrase) => {
-        const q = (phrase || '').trim()
-        if (!q) return
-        const res = await runAi(`Searching this photo for “${q}” (the first search loads the detector)…`,
-            (mod, canvas) => mod.selectText(canvas, q))
-        if (!res) return
-        commitAiMask(res, { label: `AI: ${q}`, feather: 0.03 })
-        aiSet({ status: `“${q}” — ${res.matches} region${res.matches === 1 ? '' : 's'} selected (${res.backend})` })
-    }, [runAi, commitAiMask, aiSet])
-
     // AI Box-Select — drag a box, SAM returns the object inside it.
     const onSamBox = useCallback(async (box) => {
         const res = await runAi('Box-Select: segmenting…', (mod, canvas) => mod.select(canvas, { box }))
@@ -1346,7 +1333,6 @@ function App() {
             samBox: (x0, y0, x1, y1) => onSamBox([x0, y0, x1, y1]),
             aiLasso: (pts) => onAiLasso(pts),
             clickSelect: (x, y, label = 1) => { const pts = [...clickPointsRef.current, { x, y, label }]; putClickPoints(pts); onClickSelect(pts) },
-            findText: (phrase) => runText(phrase),
             testDevice: () => testDevice(),
             exportHd: () => exportHd(),
             engine: async () => (await engine()).status(),
@@ -1367,7 +1353,7 @@ function App() {
             resetRenderMetrics: () => resetRenderMetrics(),
         }
         window.__ready = true
-    }, [imageSize, chain, baseLayer, W, H, commit, updateLayer, setFillMode, applyCurve, onExpandBoundary, ai, runSubject, runText, testDevice, exportHd, onSamBox, onAiLasso, onClickSelect, clickPoints, undo, redo, startRefine])
+    }, [imageSize, chain, baseLayer, W, H, commit, updateLayer, setFillMode, applyCurve, onExpandBoundary, ai, runSubject, testDevice, exportHd, onSamBox, onAiLasso, onClickSelect, clickPoints, undo, redo, startRefine])
 
     // Engine chip: what the lane actually resolved to, never what it intends to
     // use. Stays "starting…" until a session exists.
@@ -1523,13 +1509,6 @@ function App() {
                                         </button>
                                     )
                                 })}
-                            </div>
-                            <div className="ai-row">
-                                <input className="ai-input" placeholder="AI: describe an object… e.g. the red car" value={aiPhrase}
-                                    disabled={ai.busy}
-                                    onChange={(e) => setAiPhrase(e.target.value)}
-                                    onKeyDown={(e) => { if (e.key === 'Enter') runText(aiPhrase) }} />
-                                <button className="mask-btn" disabled={!hasImage || ai.busy || !aiPhrase} onClick={() => runText(aiPhrase)}>Find</button>
                             </div>
                             <div className="global-row">
                                 <label className="mask-toggle"><input type="checkbox" checked={penSmooth} onChange={(e) => setPenSmooth(e.target.checked)} /> Pen: smooth</label>

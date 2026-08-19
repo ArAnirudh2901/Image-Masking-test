@@ -19,6 +19,9 @@
 
 // v3 retires every cache bucket created while the automatic SAM3 upgrade was
 // available. Activation deletes obsolete buckets before serving future loads.
+// v6: the open-vocabulary text lane is gone. Returning visitors hold ~110 MB
+// of YOLOE + MobileCLIP2 weights that nothing can reach any more, and dropping
+// the bucket they live in is the only way to reclaim them.
 // v4: the text lane replaced YOLOE prompt-free + YOLO-World, and
 // yoloe-26l-text.fp16.onnx changed its txt_feats contract from a static 32
 // classes to a dynamic axis. Same URL, incompatible tensor — a browser holding
@@ -29,7 +32,7 @@
 // weights for a model the app can no longer load, and nothing would ever evict
 // them — the entries are keyed by URLs nobody requests any more. The bump is
 // the eviction.
-const CACHE_NAME = 'seglab-models-v5'
+const CACHE_NAME = 'seglab-models-v6'
 
 /**
  * URL prefixes that should be intercepted and cached. Only the ORT runtime

@@ -267,9 +267,6 @@ html, body {
 .studio-help b { color: var(--accent-ink); font-weight: 700; }
 
 .ai-badge { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 5px; letter-spacing: 0.04em; background: rgba(83,216,255,0.14); color: var(--accent-ink); }
-.ai-row { display: flex; gap: 7px; }
-.ai-input { flex: 1; min-width: 0; font-size: 11px; font-family: inherit; padding: 7px 9px; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-base); color: var(--text-primary); outline: none; }
-.ai-input:focus { border-color: rgba(83,216,255,0.4); }
 .ai-badge--ok { background: rgba(155,249,91,0.14); color: #9bf95b; }
 .ai-status { font-size: 10.5px; color: var(--text-secondary); line-height: 1.5; padding: 2px 0; }
 /* Weight-download meter. The bar is a background layer behind the label so a

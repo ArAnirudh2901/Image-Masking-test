@@ -3,7 +3,6 @@
  * Vendors every runtime asset SEGLAB needs, so the app serves fully offline:
  *   lib/ort-web/…              — onnxruntime-web (WebGPU ESM bundle + wasm loader)
  *   models/sam21/…             — SAM 2.1 small, fp16 (core)
- *   models/yoloe/…, clip-text/ — open-vocab text search (--detector)
  *   models/manifest.json       — presence signal read at runtime
  *
  * No hub publishes the exact ONNX artifacts this app runs, so the weights come
@@ -17,10 +16,8 @@
  * Idempotent: complete files are skipped.
  *
  * Usage: bun run models          (core)
- *        bun run models:all      (core + detector)
  *
  *   (core)       click/box/lasso selection + export run with no network.
- *   --detector   also fetches the open-vocabulary text-search artifacts.
  */
 
 import { execFile } from 'node:child_process'
@@ -65,17 +62,6 @@ const CORE_ASSETS = [
     ['models/sam21/model.json', 'python3 scripts/export-sam21.py'],
 ]
 
-// Open-vocabulary text search. Built locally: no hub publishes a YOLOE
-// text-prompt ONNX, and the text tower has to be the MobileCLIP2-B one
-// YOLOE-26L was trained against or RepRTA receives out-of-distribution vectors.
-const DETECTOR_ASSETS = [
-    ['models/yoloe/yoloe-26l-text.fp16.onnx', 'python3 scripts/export-yoloe-text.py'],
-    ['models/clip-text/mclip2-text.q4.onnx', 'python3 scripts/export-clip-text.py'],
-    ['models/clip-text/mclip2-embed.i8', 'python3 scripts/export-clip-text.py'],
-    ['models/clip-text/mclip2-embed.scale.f32', 'python3 scripts/export-clip-text.py'],
-    ['models/clip-text/merges.txt', 'python3 scripts/export-clip-text.py'],
-]
-
 // Prebuilt weights, published from a machine that had the export toolchain.
 // Bumping a bundle means a new tag + new digest — never overwrite an asset in
 // place, or pinned checkouts silently change models.
@@ -88,13 +74,7 @@ const WEIGHT_BUNDLES = {
         asset: 'weights-core.tar.gz',
         sha256: 'fce3b92db7e1eb915291d92da2d104a03952ff7bcde779e584cb085e552e1f4b',
     },
-    detector: {
-        asset: 'weights-detector.tar.gz',
-        sha256: '58bedb872662f244eacb67f88208937c8e0a3bf1adebd837764fa3925aa52115',
-    },
 }
-
-const withDetector = process.argv.includes('--detector')
 
 const jobs = ORT_WEB_FILES.map((f) => ({
     url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_WEB_VERSION}/dist/${f}`,
@@ -126,14 +106,24 @@ const mb = (n) => `${(n / 1024 / 1024).toFixed(2)} MB`
 
 // Idempotency is manifest-based: CDN content-length reports the compressed
 // size when content-encoding is active, so it cannot be compared to disk.
-const priorBytes = await readFile(path.join(ROOT, 'models', 'manifest.json'), 'utf8')
-    .then((s) => new Map(JSON.parse(s).files.map((f) => [f.path, f.bytes])))
-    .catch(() => new Map())
+const priorManifest = await readFile(path.join(ROOT, 'models', 'manifest.json'), 'utf8')
+    .then((s) => JSON.parse(s))
+    .catch(() => null)
+const priorBytes = new Map((priorManifest?.files || []).map((f) => [f.path, f.bytes]))
+// Size is not identity. The runtime is PINNED, so a bump must invalidate every
+// vendored ORT file even when the stale one happens to match its recorded size,
+// or the skip path hands patchOrtBundle a bundle from the previous version and
+// the run fails claiming the patch anchor is gone.
+const ortStale = priorManifest?.onnxruntimeWeb !== ORT_WEB_VERSION
+if (ortStale && priorManifest) {
+    log(`ORT pin changed (${priorManifest.onnxruntimeWeb || 'unrecorded'} -> ${ORT_WEB_VERSION}) — refetching lib/ort-web/`)
+}
 
 const download = async ({ url, dest, optional }) => {
     const target = path.join(ROOT, dest)
     const local = await stat(target).catch(() => null)
-    if (local && priorBytes.get(dest) === local.size) {
+    const pinnedRuntime = dest.startsWith('lib/ort-web/')
+    if (local && priorBytes.get(dest) === local.size && !(pinnedRuntime && ortStale)) {
         log(`have ${dest} (${mb(local.size)})`)
         return { path: dest, bytes: local.size }
     }
@@ -238,27 +228,10 @@ for (const job of jobs) {
 await ensureBundle(WEIGHT_BUNDLES.core, CORE_ASSETS)
 const missingCore = await verifyBuilt(CORE_ASSETS, files)
 
-let detectorReady = false
-if (withDetector) {
-    await ensureBundle(WEIGHT_BUNDLES.detector, DETECTOR_ASSETS)
-    detectorReady = (await verifyBuilt(DETECTOR_ASSETS, files)).length === 0
-    // Apple's Machine Learning Research Model TOU requires this notice travel
-    // with the weights, so it is printed where they actually land rather than
-    // only in NOTICE.
-    if (detectorReady) {
-        log('detector installed — two licenses ride along:')
-        log('  YOLOE (models/yoloe/) is AGPL-3.0 — https://www.ultralytics.com/license')
-        log('  MobileCLIP2 (models/clip-text/) is "licensed under the Apple Machine')
-        log('  Learning Research Model License Agreement" — RESEARCH USE ONLY, no')
-        log('  commercial use. Full terms: LICENSE-MODELS-Apple.txt')
-    }
-}
-
 const manifest = {
     onnxruntimeWeb: ORT_WEB_VERSION,
     lane: 'sam2.1-small',
     precision: 'fp16',
-    detector: detectorReady ? 'yoloe-26l-text + mobileclip2-b' : null,
     generatedAt: new Date().toISOString(),
     files,
 }
@@ -266,7 +239,6 @@ await mkdir(path.join(ROOT, 'models'), { recursive: true })
 await writeFile(path.join(ROOT, 'models', 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 const total = files.reduce((sum, f) => sum + f.bytes, 0)
 log(`done — ${files.length} files, ${mb(total)} total; wrote models/manifest.json`)
-if (!withDetector) log('open-vocab text search not registered — run `bun run models:all` to fetch it')
 // Loud, and last, so it is the thing left on screen: the app cannot segment
 // without these, and a silent manifest would let that surface as a runtime bug.
 if (missingCore.length) {
