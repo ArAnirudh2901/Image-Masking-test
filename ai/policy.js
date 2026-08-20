@@ -13,6 +13,8 @@
  * store decodes straight to the proxy and re-decodes bounded regions on demand).
  */
 
+import { estimatePostMsPerMP, loadPostFit, clearPostFit } from './hardware-fit.js'
+
 // ONE configuration (DESIGN-MASK-LANE §11). Five presets plus a capability
 // ladder plus a manual override plus four pressure levels were untestable in
 // combination, and a preset guaranteed nothing anyway: it picked numbers, and
@@ -35,6 +37,12 @@ const CONFIG = {
     proxyLongMax: 2048,      // hard stop for panoramas
     proxyPixelMax: 2_100_000, // ~2:1 fully saturated; bounds proxy RGBA at 8.4 MB
     proxyMode: 'auto',
+    // Latency the CPU post-processing stage may spend on one click. Encode and
+    // decode are flat in proxy size (encoder squashes to 1024², decoder emits
+    // 256²), so this is the only cost the proxy controls — and it is 60-70% of
+    // a warm click. hardware-fit spends it; a device with no throughput figure
+    // yet ignores it entirely.
+    postBudgetMs: 220,
     displayMax: 2560,        // crisper preview (decoupled from the model proxy)
     displayMode: 'auto',
     directMaxMP: 3,
@@ -117,6 +125,23 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         // WASM on any runtime failure, and ?force=wasm / memory pressure override.
         budget.samWebGPU = cap.gpuTier !== 'none'
         budget.mobile = !!cap.mobile
+        // Post-processing throughput (hardware-fit). A measurement stored by an
+        // earlier session on THIS device always beats the class estimate — the
+        // estimate exists only for a device that has never clicked. It expires
+        // (FIT_TTL_MS): the figure describes the machine as it was that day, and
+        // the fit only ratchets downward, so a throttled reading would otherwise
+        // follow a laptop back onto AC power for weeks.
+        if (params.get('post') === 'reset') clearPostFit()
+        const measured = loadPostFit()
+        const estimate = estimatePostMsPerMP(cap)
+        budget.postMsPerMP = measured?.msPerMP || estimate.msPerMP
+        // Band fraction is the SCENE half of the cost model: postMs scales with
+        // the refined band, not the proxy. Unknown means worst case (1), so a
+        // first click is never sized on a cheap selection this device has not
+        // made yet.
+        budget.postBandFraction = measured?.bandFraction || 1
+        budget.postMsPerMPSource = measured ? 'measured' : 'estimated'
+        budget.postFitReasons = estimate.reasons
     }
     budget.memoryLocked = locked
     budget.profileSource = 'single' // kept for telemetry; there is nothing to pick
@@ -141,6 +166,13 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
         budget.proxyMode = 'manual'
         budget.proxyMax = Math.min(4096, Math.round(Number(pq)))
     }
+
+    // ?post=0 turns the hardware judgement off (A/B and bug reports), ?post=reset
+    // forgets this device's stored measurement (handled above, before it is
+    // loaded); a number is a click-latency budget in ms. Never raises any other cap.
+    const postq = params.get('post')
+    if (postq === '0') budget.postMsPerMP = 0
+    else if (postq && Number(postq) >= 40) budget.postBudgetMs = Math.min(2000, Math.round(Number(postq)))
 
     // SAM3/flagship is retired from the editor's interactive architecture.
     // Keep this explicit value for integrations and diagnostics, but never

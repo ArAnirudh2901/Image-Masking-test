@@ -209,6 +209,10 @@ function App() {
     const lastSnapVersionsRef = useRef(new Map())  // U8: texture versions at last snapshot
     const rafRef = useRef(0)
     const cursorRef = useRef(null)       // floating brush-size ring (brush / refine)
+    const stageRef = useRef(null)        // zoom/pan clip box (gestures listens here)
+    const frameRef = useRef(null)        // the only element gestures transforms
+    const zoomRef = useRef(null)         // zoom readout, and the way back to 1x
+    const gestureHintRef = useRef(null)  // binding hint for the current input device
 
     const [imageSize, setImageSize] = useState(null)
     const [chain, setChain] = useState([])         // [{ layer, op }]
@@ -1132,6 +1136,41 @@ function App() {
         return () => window.removeEventListener('keydown', onKey)
     }, [undo, redo])
 
+    // Zoom and pan. The bindings belong to the DEVICE, not the tool — the same
+    // two-finger movement is a scroll on a trackpad and a pinch on glass — so
+    // they live in their own module. Loaded through a runtime import like the
+    // rest of ai/, which keeps that directory out of the bundle.
+    const hasImageRef = useRef(false)
+    hasImageRef.current = hasImage
+    useEffect(() => {
+        if (!hasImage) return
+        let g = null
+        let dead = false
+        import(/* @vite-ignore */ new URL('ai/gestures.js', document.baseURI).href)
+            .then(({ createGestures }) => {
+                if (dead || !stageRef.current || !frameRef.current) return
+                g = createGestures({
+                    stage: stageRef.current,
+                    frame: frameRef.current,
+                    surface: overlayRef.current,
+                    hint: gestureHintRef.current,
+                    readout: zoomRef.current,
+                    active: () => hasImageRef.current,
+                    // A second finger is a view gesture, never a stroke: drop
+                    // whatever the first one started, before it commits a mask
+                    // nobody asked for.
+                    onGestureStart: () => {
+                        dragRef.current = null
+                        setDraft([])
+                        setSamBox(null)
+                        setAiLasso(null)
+                    },
+                })
+            })
+            .catch((err) => console.warn('[studio] gestures unavailable', err))
+        return () => { dead = true; g?.destroy() }
+    }, [hasImage])
+
     /* ── live render ───────────────────────────────────────────────────── */
     // Deliberately NOT rAF-coalesced. It looks like it should be — every pass
     // renders the whole proxy on the GPU and reads it back — but the renderer's own
@@ -1401,6 +1440,9 @@ function App() {
                 <label className="mask-toggle"><input type="checkbox" checked={overlayMode} onChange={(e) => setOverlayMode(e.target.checked)} /> Show mask overlay</label>
                 <label className="mask-toggle"><input type="checkbox" checked={globalInvert} onChange={(e) => setGlobalInvert(e.target.checked)} /> Invert all</label>
                 <span className="hint">{status}</span>
+                {/* Written by ai/gestures.js: it names the bindings the current input
+                    device actually has, and rewrites them when the device changes. */}
+                <span className="hint gesture-hint" ref={gestureHintRef} />
                 {/* AGPL-3.0 §13: whoever interacts with this over a network has to be
                     offered the corresponding source, so the offer lives in the UI. */}
                 <a className="src-link" href={SOURCE_URL} target="_blank" rel="noreferrer"
@@ -1410,18 +1452,29 @@ function App() {
             <div className="studio-main">
                 <div className="stage-wrap">
                     {hasImage ? (
-                        <div className="stage">
-                            <canvas ref={dispRef} className="display" />
-                            <canvas
-                                ref={overlayRef}
-                                className={`overlay ${tool ? 'drawing' : ''}`}
-                                onPointerDown={onPointerDown}
-                                onPointerMove={onPointerMove}
-                                onPointerUp={onPointerUp}
-                                onPointerLeave={() => { if (cursorRef.current) cursorRef.current.style.display = 'none' }}
-                                onDoubleClick={() => tool === 'pen' && closePen()}
-                                style={{ pointerEvents: preview ? 'none' : 'auto', cursor: tool === 'brush' || tool === 'refine' ? 'none' : tool ? 'crosshair' : 'default', touchAction: 'none' }}
-                            />
+                        <div className="stage" ref={stageRef}>
+                            {/* Only .frame is zoomed and panned. The brush ring, the tool
+                                banner and the zoom pill are its SIBLINGS, so they keep
+                                their real size at every zoom level, and every
+                                pointer-to-image conversion still works untouched: it goes
+                                through getBoundingClientRect, which already reports the
+                                transformed box. */}
+                            <div className="frame" ref={frameRef}>
+                                <canvas ref={dispRef} className="display" />
+                                <canvas
+                                    ref={overlayRef}
+                                    className={`overlay ${tool ? 'drawing' : ''}`}
+                                    onPointerDown={onPointerDown}
+                                    onPointerMove={onPointerMove}
+                                    onPointerUp={onPointerUp}
+                                    onPointerLeave={() => { if (cursorRef.current) cursorRef.current.style.display = 'none' }}
+                                    onDoubleClick={() => tool === 'pen' && closePen()}
+                                    style={{ pointerEvents: preview ? 'none' : 'auto', cursor: tool === 'brush' || tool === 'refine' ? 'none' : tool ? 'crosshair' : 'default', touchAction: 'none' }}
+                                />
+                            </div>
+                            {/* No children and a constant `hidden` in JSX: React never
+                                diffs either, so gestures owns the label and the flag. */}
+                            <button className="zoom-reset" ref={zoomRef} type="button" hidden title="Reset zoom (0)" />
                             {(tool === 'brush' || tool === 'refine') && <div ref={cursorRef} className="brush-cursor" />}
                             {tool && (
                                 <div className="tool-banner">

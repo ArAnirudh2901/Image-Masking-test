@@ -193,6 +193,11 @@ html, body {
 .studio-top h1 b { color: var(--accent-ink); }
 .studio-top .spacer { flex: 1; }
 .studio-top .hint { font-size: 11px; color: var(--text-muted); }
+.studio-top .gesture-hint kbd {
+  font-family: inherit; font-size: 10px; padding: 1px 5px; border-radius: 4px; color: var(--text-secondary);
+  background: rgba(244,244,245,0.06); border: 1px solid rgba(244,244,245,0.12);
+}
+.studio-top .gesture-hint .sep { opacity: 0.4; margin: 0 2px; }
 /* AGPL-3.0 §13 source offer — visible, but never louder than the tools. */
 .studio-top .src-link {
   font-size: 11px; color: var(--text-muted); text-decoration: none;
@@ -202,8 +207,27 @@ html, body {
 
 .studio-main { display: flex; flex: 1; min-height: 0; }
 
-.stage-wrap { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; padding: 18px; background: radial-gradient(circle at 50% 30%, #111110, #070707 70%); position: relative; }
-.stage { position: relative; display: grid; justify-items: center; align-items: center; max-width: 100%; max-height: 100%; line-height: 0; }
+.stage-wrap { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; padding: 18px; background: radial-gradient(circle at 50% 30%, #111110, #070707 70%); position: relative; overflow: hidden; }
+/* The clip box. Zoomed-in pixels stop here, and every gesture listener in
+   ai/gestures.js is bound to this element rather than to the canvases, so a
+   second finger can cancel a stroke before the overlay ever sees it. */
+.stage { position: relative; overflow: hidden; max-width: 100%; max-height: 100%; line-height: 0; touch-action: none; }
+/* The only element the zoom/pan transform touches. transform-origin must stay at
+   the top-left: gestures clamps the pan against the stage's own origin, and a
+   centred origin would double every offset it computes. */
+.frame { position: relative; display: grid; justify-items: center; align-items: center; transform-origin: 0 0; will-change: transform; }
+/* Inline styles set the overlay's tool cursor, so the pan cursor has to outrank
+   them — !important in a stylesheet beats a non-important inline declaration. */
+.stage[data-pan="ready"] .overlay { cursor: grab !important; }
+.stage[data-pan="active"] .overlay { cursor: grabbing !important; }
+/* Zoom readout — present only while zoomed, and it is the way back to 1x. */
+.zoom-reset {
+  position: absolute; right: 10px; bottom: 10px; z-index: 22;
+  font-size: 11px; line-height: 1.3; padding: 5px 10px; border-radius: 8px; cursor: pointer;
+  background: rgba(10,12,16,0.92); color: var(--text-secondary); font-family: inherit;
+  border: 1px solid rgba(6,184,212,0.3); backdrop-filter: blur(8px); font-variant-numeric: tabular-nums;
+}
+.zoom-reset[hidden] { display: none; }
 /* Stack the display + overlay canvases in ONE grid cell (grid-area 1/1) so they
    share IDENTICAL replaced-element sizing — same max-width/max-height, same
    aspect ratio — and line up pixel-for-pixel. Previously the overlay was

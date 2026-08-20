@@ -9,19 +9,30 @@
  */
 
 import { bandAlpha, bandAlphaRect, refineField, lastRefineStats } from './mask-refine.js'
+import { cleanRegions } from './mask-select.js'
+
+/** Smallest rect covering both, either of which may be absent. Ends exclusive. */
+const unionRect = (a, b) => {
+    if (!a) return b || null
+    if (!b) return a
+    return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]
+}
 
 // Catmull-Rom (a = -0.5) cubic kernel, evaluated directly. Four taps per axis,
 // no matrices, no library — the whole upsample is ~16 multiply-adds per pixel.
+// Weights land in a shared 4-slot buffer: the x-tap loop calls this once per
+// output column, and a fresh array each time is pure collector pressure. Every
+// caller consumes the taps before the next call.
+const taps = new Float32Array(4)
 const cubic = (t) => {
     const t2 = t * t
     const t3 = t2 * t
-    // Returns the four tap weights for offsets -1, 0, +1, +2.
-    return [
-        -0.5 * t3 + t2 - 0.5 * t,
-        1.5 * t3 - 2.5 * t2 + 1,
-        -1.5 * t3 + 2 * t2 + 0.5 * t,
-        0.5 * t3 - 0.5 * t2,
-    ]
+    // The four tap weights for offsets -1, 0, +1, +2.
+    taps[0] = -0.5 * t3 + t2 - 0.5 * t
+    taps[1] = 1.5 * t3 - 2.5 * t2 + 1
+    taps[2] = -1.5 * t3 + 2 * t2 + 0.5 * t
+    taps[3] = 0.5 * t3 - 0.5 * t2
+    return taps
 }
 
 /**
@@ -72,6 +83,7 @@ export const upsampleLogits = (logits, w, h, maskSide) => {
     // refineField would otherwise need its own full-frame scan to find it.
     const BAND = 6
     let minX = w; let minY = h; let maxX = -1; let maxY = -1
+    let bx0 = w; let by0 = h; let bx1 = -1; let by1 = -1
     for (let y = 0; y < h; y += 1) {
         const fy = (y + 0.5) * sy - 0.5
         const y0 = Math.floor(fy)
@@ -86,19 +98,46 @@ export const upsampleLogits = (logits, w, h, maskSide) => {
         const r2 = clampIdx(y0 + 1) * w
         const r3 = clampIdx(y0 + 2) * w
         const row = y * w
+        // Row-local extents: x only ever increases, so the running max is a
+        // store rather than a compare, and the y bounds move twice per row
+        // instead of once per pixel.
+        let mLo = -1; let mHi = -1
+        let bLo = -1; let bHi = -1
         for (let x = 0; x < w; x += 1) {
             const v = tmp[r0 + x] * k0 + tmp[r1 + x] * k1
                 + tmp[r2 + x] * k2 + tmp[r3 + x] * k3
             out[row + x] = v
-            if (v > -BAND && v < BAND) {
-                if (x < minX) minX = x
-                if (x > maxX) maxX = x
-                if (y < minY) minY = y
-                if (y > maxY) maxY = y
+            // Two boxes out of one test. The band box (|v| < BAND) is what the
+            // guided filter needs. The mask box (v > -BAND) is its superset and
+            // is the window region hygiene scans: it has to contain the mask's
+            // INTERIOR, because a subject running off-frame has foreground with
+            // no zero crossing beside it, and a band-only window would read that
+            // as a component of its own.
+            if (v > -BAND) {
+                if (mLo < 0) mLo = x
+                mHi = x
+                if (v < BAND) { if (bLo < 0) bLo = x; bHi = x }
             }
         }
+        if (mHi >= 0) {
+            if (mLo < bx0) bx0 = mLo
+            if (mHi > bx1) bx1 = mHi
+            if (by1 < 0) by0 = y
+            by1 = y
+        }
+        if (bHi >= 0) {
+            if (bLo < minX) minX = bLo
+            if (bHi > maxX) maxX = bHi
+            if (maxY < 0) minY = y
+            maxY = y
+        }
     }
-    return { field: out, bbox: maxX < 0 ? null : [minX, minY, maxX, maxY] }
+    return {
+        field: out,
+        bbox: maxX < 0 ? null : [minX, minY, maxX, maxY],
+        // Ends exclusive — a scan window, not an inclusive bbox.
+        box: bx1 < 0 ? null : [bx0, by0, bx1 + 1, by1 + 1],
+    }
 }
 
 // The band is specified in PIXELS and converted to logit units per image. A
@@ -139,9 +178,9 @@ export const bandWidth = (field, w, bbox) => {
  * continuous field the export path reads. `guide` may be null (tainted canvas):
  * the raw mask still ships, unrefined.
  */
-export const postCompute = ({ logits, guide, w, h, maskSide }) => {
+export const postCompute = ({ logits, guide, w, h, maskSide, clicks = [], tight = false }) => {
     const tU = performance.now()
-    const { field, bbox } = upsampleLogits(logits, w, h, maskSide)
+    const { field, bbox, box } = upsampleLogits(logits, w, h, maskSide)
     // Raw first: the refinement rewrites `field` in place, and the app's
     // raw/refined toggle needs both.
     const tB = performance.now()
@@ -153,18 +192,43 @@ export const postCompute = ({ logits, guide, w, h, maskSide }) => {
     // Guided filter against the photo's own luma: pulls the boundary onto the
     // real object edge instead of wherever the 256² grid put it.
     let rgba = rawRgba
+    // Pixels the refinement actually walked — the quantity post cost scales
+    // with, and hardware-fit's normaliser. The proxy's own area is not: one
+    // 1.376 MP proxy cost 12.2 ms for a 9.7 kpx band and 52.6 ms for a
+    // frame-spanning one.
+    let bandPixels = 0
+    // Refinement rewrites only its own rect and hygiene only its own runs, so
+    // the mask is re-thresholded over the union of the two rather than paying a
+    // second full-frame pass.
+    let paint = null
     const tG = performance.now()
     let tF = tG
     try {
         const rect = guide && refineField(field, guide, w, h, bbox, { radius: 8, eps: 1e-4, scale: 4 })
         tF = performance.now()
         if (rect) {
-            // Refinement only rewrote `rect`; the rest of the field is
-            // untouched, so copy the raw mask and re-threshold just that band
-            // instead of paying a second full-frame pass.
-            rgba = bandAlphaRect(field, w, rect, BAND, new Uint8ClampedArray(rawRgba))
+            bandPixels = (rect[2] - rect[0]) * (rect[3] - rect[1])
+            paint = rect
         }
     } catch { /* refinement failed — the raw mask still ships */ }
+
+    // Region hygiene at PROXY resolution — after the upsample and the guided
+    // filter, the two stages that manufacture speckle out of a field that
+    // reached them clean (mask-select). Fill is 2·BAND, not the 256² default:
+    // this field is matted in BAND units, and on a steep field a fixed 2.5 lands
+    // inside the ramp and leaves a half-transparent patch behind.
+    //
+    // Scanned over the union of the mask box and the rect the filter rewrote.
+    // The filter works on the BAND box plus its own pad (radius·2 + scale·2 =
+    // 24 px), which reaches outside the mask box, and a pixel it lifts over zero
+    // out there is a component no pass would otherwise see.
+    const scan = unionRect(box, paint)
+    const regions = scan
+        ? cleanRegions(field, w, h, { clicks, rect: scan, fill: Math.max(2.5, 2 * BAND), tight })
+        : { islands: 0, holes: 0, dirty: null }
+    const tH = performance.now()
+    if (regions.dirty) paint = unionRect(paint, regions.dirty)
+    if (paint) rgba = bandAlphaRect(field, w, paint, BAND, new Uint8ClampedArray(rawRgba))
 
     const stages = {
         upsampleMs: +(tB - tU).toFixed(1),
@@ -172,10 +236,14 @@ export const postCompute = ({ logits, guide, w, h, maskSide }) => {
         bandAlphaMs: +(tR - tA).toFixed(1),
         guideMs: +(tG - tR).toFixed(1),
         refineMs: +(tF - tG).toFixed(1),
-        rethresholdMs: +(performance.now() - tF).toFixed(1),
+        hygieneMs: +(tH - tF).toFixed(1),
+        rethresholdMs: +(performance.now() - tH).toFixed(1),
         // Refinement cost is linear in the cells the filter walked; without the
         // decomposition a slow refine is indistinguishable from a slow filter.
         refineShape: lastRefineStats,
     }
-    return { rgba, rawRgba, field, stages }
+    // Every non-zero alpha is inside maskRect: `box` is where the field clears
+    // -BAND (what bandAlpha paints), and `paint` is the only place anything was
+    // rewritten after. Saves the caller a full-frame scan to summarise the mask.
+    return { rgba, rawRgba, field, stages, bandPixels, regions, maskRect: unionRect(box, paint) }
 }

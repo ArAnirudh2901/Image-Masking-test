@@ -19,6 +19,7 @@
  */
 
 import { applyMemoryPressure, resolveBudget } from './policy.js'
+import { observeBandFraction, observePost, savePostFit } from './hardware-fit.js'
 import { probeCapability } from './capability.js'
 import { createMemoryGovernor } from './memory-governor.js'
 import { clearHeavyQueue, getHeavyQueueState } from './heavy-job-queue.js'
@@ -387,23 +388,49 @@ export const releaseImage = () => {
 
 /* ─── selection ──────────────────────────────────────────────────────────── */
 
-const finish = (res, imageData, extra = {}) => ({
-    stale: false,
-    usable: res.usable,
-    reason: res.reason,
-    canvas: fieldToCanvas(imageData),
-    imageData,
-    coverage: coverageOf(imageData),
-    score: res.score,
-    lane: res.lane,
-    device: res.device,
-    encoded: res.encoded,
-    ms: res.ms,
-    // Stage breakdown. `ms` alone cannot tell a slow encode from a slow refine,
-    // which is the only question worth asking when a selection feels sluggish.
-    stages: res.stages || null,
-    ...extra,
-})
+/**
+ * Feed one real click back into hardware-fit, which sizes the proxy.
+ *
+ * Two figures, because postMs has two causes: the DEVICE's rate and the SCENE's
+ * band. A click whose refined area is unknown updates neither — dividing it by
+ * the proxy alone would credit a compact selection to the machine and report it
+ * ~4.5x slower than it is. An encoding click is excluded: its postMs carries
+ * the encode.
+ */
+const noteClickCost = (imageData) => {
+    const run = clientState.lastRun
+    if (!run || run.encoded || !(run.postMs > 0)) return
+    const mp = (imageData.width * imageData.height) / 1e6
+    if (!(mp > 0) || !(run.bandPixels > 0)) return
+    const fraction = run.bandPixels / (mp * 1e6)
+    const next = observePost(BUDGET.postMsPerMP, run.postMs, mp, fraction)
+    if (!next) return
+    BUDGET.postMsPerMP = next
+    BUDGET.postMsPerMPSource = 'measured'
+    BUDGET.postBandFraction = observeBandFraction(BUDGET.postBandFraction, fraction)
+    savePostFit({ msPerMP: next, bandFraction: BUDGET.postBandFraction })
+}
+
+const finish = (res, imageData, extra = {}) => {
+    noteClickCost(imageData)
+    return {
+        stale: false,
+        usable: res.usable,
+        reason: res.reason,
+        canvas: fieldToCanvas(imageData),
+        imageData,
+        coverage: coverageOf(imageData),
+        score: res.score,
+        lane: res.lane,
+        device: res.device,
+        encoded: res.encoded,
+        ms: res.ms,
+        // Stage breakdown. `ms` alone cannot tell a slow encode from a slow refine,
+        // which is the only question worth asking when a selection feels sluggish.
+        stages: res.stages || null,
+        ...extra,
+    }
+}
 
 /**
  * One selection against the ≤proxy working canvas. Coordinates are canvas

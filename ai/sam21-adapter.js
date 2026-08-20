@@ -38,6 +38,10 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const kx = SIDE / canvas.width
     const ky = SIDE / canvas.height
     const pts = (clicks || []).map(([x, y, label]) => ({ x: x * kx, y: y * ky, label: label ?? 1 }))
+    // The same prompts in PROXY space, for the hygiene pass that runs after the
+    // post pipeline: an include click protects the component it landed on, and
+    // that component only exists once the field has been upsampled.
+    const proxyPts = (clicks || []).map(([x, y, label]) => ({ x, y, label: label ?? 1 }))
     // A box IS expressible: SAM 2.1 encodes it as its two corners with labels
     // 2 (top-left) and 3 (bottom-right). The decoder carries
     // prompt_encoder.point_embeddings.2/.3 and branches on those label values —
@@ -110,13 +114,14 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const t2 = performance.now()
     const w = canvas.width
     const h = canvas.height
-    const { rgba, rawRgba } = await postProcessAsync(canvas, imageKey, dec.logits, w, h)
+    const { rgba, rawRgba, bandPixels, regions, maskRect } =
+        await postProcessAsync(canvas, imageKey, dec.logits, w, h, proxyPts)
 
     // Park every candidate SAM already computed, ordered small → large, so the
     // app can answer "you took the wrong part of it" with a repaint. The
     // inference is already paid for; the only cost is 256 KB per plane.
     candidates = orderCandidates({
-        imageKey, canvas, w, h,
+        imageKey, canvas, w, h, clicks: proxyPts,
         planes: [dec.logits, ...(dec.alternates || [])],
         scores: [dec.iou, ...(dec.altScores || [])],
     })
@@ -132,13 +137,25 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
         decodeMs: +decodeMs.toFixed(1),
         postMs: +(performance.now() - t2).toFixed(1),
         postStages: lastPostStages,
+        // hardware-fit's normaliser: postMs scales with the band the filter
+        // walked, not with the proxy's own area.
+        bandPixels,
+        maskRect,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),
         // Why this candidate won, and what region hygiene removed. Debug-only,
         // but it is the difference between "the mask is wrong" and knowing which
         // of six mechanisms produced it.
-        pick: { reason: dec.reason, stability: dec.stability, refined: dec.refined, regions: dec.regions },
+        pick: {
+            reason: dec.reason,
+            stability: dec.stability,
+            refined: dec.refined,
+            regions: dec.regions,
+            // Hygiene at proxy scale, which the 256² pass cannot see: the
+            // upsample and the guided filter both manufacture speckle.
+            postRegions: regions,
+        },
     }
 }
 
@@ -176,20 +193,27 @@ const adoptPost = (imageKey, w, h, out) => {
     // 8256×5504 is what makes edges stair-step, and no amount of export-time
     // filtering recovers from it (§10).
     lastField = { imageKey, w, h, field: out.field }
-    return { rgba: out.rgba, rawRgba: out.rawRgba }
+    return {
+        rgba: out.rgba,
+        rawRgba: out.rawRgba,
+        bandPixels: out.bandPixels || 0,
+        regions: out.regions || null,
+        maskRect: out.maskRect || null,
+    }
 }
 
-/** In-process post — the fallback, and the only path candidate cycling uses. */
-const postProcess = (canvas, imageKey, logits, w, h) => {
+/** In-process post — the fallback path. */
+const postProcess = (canvas, imageKey, logits, w, h, clicks = [], tight = false) => {
     let guide = null
     try { guide = guidePixels(canvas, imageKey, w, h) } catch { /* tainted canvas */ }
-    return adoptPost(imageKey, w, h, postCompute({ logits, guide, w, h, maskSide: MASK_SIDE }))
+    return adoptPost(imageKey, w, h,
+        postCompute({ logits, guide, w, h, maskSide: MASK_SIDE, clicks, tight }))
 }
 
 /** Off-thread post, falling back in-process so a broken worker costs jank only. */
-const postProcessAsync = async (canvas, imageKey, logits, w, h) => {
-    const reply = await postAsync({ canvas, imageKey, logits, w, h, maskSide: MASK_SIDE })
-    if (!reply) return postProcess(canvas, imageKey, logits, w, h)
+const postProcessAsync = async (canvas, imageKey, logits, w, h, clicks = [], tight = false) => {
+    const reply = await postAsync({ canvas, imageKey, logits, w, h, maskSide: MASK_SIDE, clicks, tight })
+    if (!reply) return postProcess(canvas, imageKey, logits, w, h, clicks, tight)
     return adoptPost(imageKey, w, h, unpackPost(reply))
 }
 
@@ -207,14 +231,14 @@ const postProcessAsync = async (canvas, imageKey, logits, w, h) => {
  */
 let candidates = null
 
-const orderCandidates = ({ imageKey, canvas, w, h, planes, scores }) => {
+const orderCandidates = ({ imageKey, canvas, w, h, clicks, planes, scores }) => {
     const rows = planes
         .map((p, i) => ({ p, score: scores[i] ?? 0, area: fieldArea(p), first: i === 0 }))
         .filter((r) => r.area > 0)
         .sort((a, b) => a.area - b.area)
     if (!rows.length) return null
     const index = Math.max(0, rows.findIndex((r) => r.first))
-    return { imageKey, canvas, w, h, rows, index }
+    return { imageKey, canvas, w, h, clicks: clicks || [], rows, index }
 }
 
 const candidateInfo = () =>
@@ -242,8 +266,12 @@ export const sam21Cycle = async (delta = 1, imageKey = null) => {
     const n = candidates.rows.length
     candidates.index = (candidates.index + (delta < 0 ? n - 1 : 1)) % n
     const row = candidates.rows[candidates.index]
-    const { canvas, w, h } = candidates
-    const { rgba, rawRgba } = await postProcessAsync(canvas, candidates.imageKey, row.p, w, h)
+    const { canvas, w, h, clicks } = candidates
+    // Tight hygiene, which a first click does not get: cycling means "the thing
+    // I pointed at, at another scope", so a plane that answers with other
+    // objects is answering a question nobody asked (mask-select, tight mode).
+    const { rgba, rawRgba, bandPixels, maskRect } =
+        await postProcessAsync(canvas, candidates.imageKey, row.p, w, h, clicks, true)
     return {
         rgba,
         rawRgba,
@@ -254,6 +282,8 @@ export const sam21Cycle = async (delta = 1, imageKey = null) => {
         encodeMs: 0,
         decodeMs: 0,
         postMs: +(performance.now() - t0).toFixed(1),
+        bandPixels,
+        maskRect,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),

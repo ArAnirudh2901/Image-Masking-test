@@ -8,7 +8,7 @@
 import { enqueueHeavy, STALE } from './heavy-job-queue.js'
 import { readImageMeta } from './image-io.js'
 import { decodeBoundedBitmap, decodeWithWorkingCopy, decodeOpaqueBounded } from './decode-core.js'
-import { interactionPlan } from './proxy-plan.js'
+import { interactionPlan, planBudget } from './proxy-plan.js'
 
 export { STALE }
 
@@ -136,13 +136,11 @@ export const decodeProxy = ({
 export const decodeOpaque = ({ blob, budget, revision = null, isCurrent = null }) => enqueueHeavy(
     'decode-proxy',
     async () => {
-        const slim = {
-            proxyMax: budget.proxyMax,
-            proxyMode: budget.proxyMode,
-            directMaxMP: budget.directMaxMP,
-            directMaxSide: budget.directMaxSide,
-            safeProxyMax: budget.safeProxyMax,
-        }
+        // Owned by proxy-plan, next to the function that reads it — this
+        // hand-kept list drifted and sized opaque formats differently from
+        // every other import path (it omitted the per-axis and throughput keys,
+        // so the same image got a 1024 long edge here and 1536×1024 elsewhere).
+        const slim = planBudget(budget)
         const roundtrip = post({ type: 'decode-opaque', revision, blob, budget: slim })
         if (roundtrip) {
             const res = await roundtrip

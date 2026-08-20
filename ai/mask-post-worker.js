@@ -8,10 +8,10 @@
  * when `guide` in the reply shows this worker lacks it at that size.
  *
  * in : { type:'post', requestId, imageKey, logits: ArrayBuffer (transfer),
- *        w, h, maskSide, guide: ArrayBuffer|null (transfer) }
+ *        w, h, maskSide, clicks, tight, guide: ArrayBuffer|null (transfer) }
  * in : { type:'dispose' }
  * out: { type:'result', requestId, rgba, rawRgba, field (all transfer),
- *        stages, guide: {key,w,h}|null }
+ *        stages, bandPixels, regions, maskRect, guide: {key,w,h}|null }
  * out: { type:'error', requestId, error }
  */
 
@@ -26,15 +26,16 @@ self.onmessage = (event) => {
     if (msg.type === 'dispose' || msg.type === 'drop-guide') { guide = null; return }
     if (msg.type !== 'post') return
 
-    const { requestId, imageKey, w, h, maskSide } = msg
+    const { requestId, imageKey, w, h, maskSide, clicks, tight } = msg
     try {
         if (msg.guide) guide = { key: imageKey, w, h, px: new Uint8ClampedArray(msg.guide) }
         // A stale guide is worse than none: it would refine against the wrong
         // photo. Drop it and ship the raw mask; the client re-sends next call.
         else if (!guide || guide.key !== imageKey || guide.w !== w || guide.h !== h) guide = null
 
-        const { rgba, rawRgba, field, stages } = postCompute({
+        const { rgba, rawRgba, field, stages, bandPixels, regions, maskRect } = postCompute({
             logits: new Float32Array(msg.logits), guide: guide?.px || null, w, h, maskSide,
+            clicks: clicks || [], tight: !!tight,
         })
         // Unrefined masks come back as the SAME array (postCompute starts with
         // `rgba = rawRgba`). Transferring one buffer twice throws, so send it
@@ -51,6 +52,9 @@ self.onmessage = (event) => {
             aliased,
             field: field.buffer,
             stages,
+            bandPixels,
+            regions,
+            maskRect,
             // Identity, not just the key — the client re-sends on a size change.
             guide: guide ? { key: guide.key, w: guide.w, h: guide.h } : null,
         }, transfer)

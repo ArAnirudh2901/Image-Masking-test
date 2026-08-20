@@ -91,7 +91,7 @@ const readGuide = (canvas, w, h) => {
  * candidate parking in sam21-adapter keeps the caller's plane for cycling.
  * Resolves null when the worker could not serve it — run postCompute yourself.
  */
-export const postAsync = ({ canvas, imageKey, logits, w, h, maskSide }) => {
+export const postAsync = ({ canvas, imageKey, logits, w, h, maskSide, clicks = [], tight = false }) => {
     const wk = getWorker()
     if (!wk) return Promise.resolve(null)
 
@@ -125,6 +125,8 @@ export const postAsync = ({ canvas, imageKey, logits, w, h, maskSide }) => {
                 w,
                 h,
                 maskSide,
+                clicks,
+                tight,
             }, transfer)
         } catch (err) {
             clearTimeout(timer)
@@ -143,6 +145,9 @@ export const unpackPost = (data) => {
         rawRgba,
         field: new Float32Array(data.field),
         stages: data.stages,
+        bandPixels: data.bandPixels || 0,
+        regions: data.regions || null,
+        maskRect: data.maskRect || null,
     }
 }
 
