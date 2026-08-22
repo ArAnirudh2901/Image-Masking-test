@@ -18,7 +18,7 @@
 
 import { summarizeMaskRGBA, validateClickMask } from './sam-core.js'
 import { enqueueHeavy, cancelHeavyBefore, onHeavyActivity, STALE } from './heavy-job-queue.js'
-import { sam21Candidates, sam21Cycle, sam21HdCompose, sam21Segment } from './sam21-adapter.js'
+import { sam21Candidates, sam21Cycle, sam21Finish, sam21HdCompose, sam21Segment } from './sam21-adapter.js'
 import { LANE } from './sam21-lane.js'
 import { noteModel } from './model-registry.js'
 import { contentKey } from './canvas-hash.js'
@@ -159,11 +159,19 @@ export const forgetEncoder = () => { encoderBuilt = false; encoderPromise = null
  * returns the polished mask (clamp → hygiene → edge refinement) plus the raw
  * decoder mask for the UI's comparison toggle.
  *
+ * `decodeOnly` stops after the decoder and returns the raw 256² probe — no
+ * post pipeline, no candidate parking, no client state churn. AI Subject uses
+ * it to rank four prompts for the price of one post; `finishDecode` then
+ * completes the winner.
+ *
  * @param {HTMLCanvasElement} canvas
  * @param {{ clicks?: Array<[number, number, 0|1]>, box?: number[]|null,
- *           revision?: number }} prompts
+ *           revision?: number, prior?: Uint8Array|null, fit?: object|null,
+ *           decodeOnly?: boolean }} prompts
  */
-export const segment = async (canvas, { clicks = [], box = null, revision } = {}) => {
+export const segment = async (canvas, {
+    clicks = [], box = null, revision, prior = null, fit = null, decodeOnly = false,
+} = {}) => {
     const startedAt = Date.now()
     if (!canvas?.width || !canvas?.height) throw new Error('Selection source has no usable dimensions')
     if ((!clicks || clicks.length === 0) && !box) throw new Error('No clicks or box to select with')
@@ -175,7 +183,8 @@ export const segment = async (canvas, { clicks = [], box = null, revision } = {}
     // slot here so it cannot overlap an export/refine in THIS tab.
     const r = await enqueueHeavy('segment', () => {
         return sam21Segment({
-            canvas, imageKey, clicks, box, onWait: (w) => emit({ type: 'waiting', ...w }),
+            canvas, imageKey, clicks, box, prior, fit, decodeOnly,
+            onWait: (w) => emit({ type: 'waiting', ...w }),
         })
     }, { priority: 'high', revision: revision ?? null }).catch(async (err) => {
         // The queue's watchdog fired, so the host is wedged (or its GPU work is)
@@ -190,6 +199,20 @@ export const segment = async (canvas, { clicks = [], box = null, revision } = {}
     })
     // A cancelled job: no mask, no state churn — the caller just drops it.
     if (r === STALE || r?.stale) return { stale: true, revision: r?.revision ?? revision }
+    // A probe carries no mask, so there is nothing to summarise or publish yet.
+    if (r?.decodeOnly) return { ...r, startedAt }
+    return finishSegment(r, revision, startedAt)
+}
+
+/**
+ * Complete a `decodeOnly` probe: run the post pipeline on ITS logits and
+ * publish it like any other selection. Not queued through enqueueHeavy — the
+ * decode already took its slot, and this is an upsample plus a guided filter
+ * dispatched to the mask-post worker.
+ */
+export const finishDecode = async (probe, { revision } = {}) => {
+    const startedAt = probe?.startedAt ?? Date.now()
+    const r = await sam21Finish(probe)
     return finishSegment(r, revision, startedAt)
 }
 
@@ -241,6 +264,8 @@ function finishSegment(result, revision, startedAt) {
         hygiene: result.hygiene,
         bandPixels: result.bandPixels,
         candidates: result.candidates,
+        // Which parked field this mask came from — see sam21-adapter currentField.
+        decodeId: result.decodeId ?? 0,
         pick: result.pick,
         cycled: result.cycled,
         ms: Date.now() - startedAt,
@@ -313,6 +338,7 @@ export const hdExport = async (payload) => {
         doDecode: payload.doDecode,
         cropKey: payload.cropKey,
         prompts: payload.prompts,
+        decodeId: payload.decodeId ?? null,
     }), { priority: 'high', revision: payload?.revision ?? null })
     if (out === STALE || out?.stale) return { stale: true }
     try { payload.source.close?.() } catch { /* already gone */ }

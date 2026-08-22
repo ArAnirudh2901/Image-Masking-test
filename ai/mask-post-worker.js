@@ -8,34 +8,43 @@
  * when `guide` in the reply shows this worker lacks it at that size.
  *
  * in : { type:'post', requestId, imageKey, logits: ArrayBuffer (transfer),
- *        w, h, maskSide, clicks, tight, guide: ArrayBuffer|null (transfer) }
+ *        w, h, maskSide, clicks, tight, fit, guide: ArrayBuffer|null (transfer) }
  * in : { type:'dispose' }
  * out: { type:'result', requestId, rgba, rawRgba, field (all transfer),
  *        stages, bandPixels, regions, maskRect, guide: {key,w,h}|null }
  * out: { type:'error', requestId, error }
  */
 
-import { postCompute } from './mask-post-core.js'
+import { buildEdgeMap, postCompute } from './mask-post-core.js'
 
 let guide = null   // { key, w, h, px }
+// Edge statistics for THIS guide — a per-photo summary (~114 KB) the adaptive
+// band width and the filter-option choice both read. Built with the guide and
+// dropped with it, so the two can never describe different photos.
+let edges = null
 
 self.onmessage = (event) => {
     const msg = event.data || {}
     // drop-guide, not dispose: under pressure the ~7 MB guide is the cost, and
     // the worker itself has to stay — post is not optional the way refine is.
-    if (msg.type === 'dispose' || msg.type === 'drop-guide') { guide = null; return }
+    if (msg.type === 'dispose' || msg.type === 'drop-guide') { guide = null; edges = null; return }
     if (msg.type !== 'post') return
 
-    const { requestId, imageKey, w, h, maskSide, clicks, tight } = msg
+    const { requestId, imageKey, w, h, maskSide, clicks, tight, fit } = msg
     try {
-        if (msg.guide) guide = { key: imageKey, w, h, px: new Uint8ClampedArray(msg.guide) }
+        if (msg.guide) {
+            guide = { key: imageKey, w, h, px: new Uint8ClampedArray(msg.guide) }
+            edges = buildEdgeMap(guide.px, w, h)
         // A stale guide is worse than none: it would refine against the wrong
         // photo. Drop it and ship the raw mask; the client re-sends next call.
-        else if (!guide || guide.key !== imageKey || guide.w !== w || guide.h !== h) guide = null
+        } else if (!guide || guide.key !== imageKey || guide.w !== w || guide.h !== h) {
+            guide = null
+            edges = null
+        }
 
         const { rgba, rawRgba, field, stages, bandPixels, regions, maskRect } = postCompute({
             logits: new Float32Array(msg.logits), guide: guide?.px || null, w, h, maskSide,
-            clicks: clicks || [], tight: !!tight,
+            clicks: clicks || [], tight: !!tight, edges, fit: fit || null,
         })
         // Unrefined masks come back as the SAME array (postCompute starts with
         // `rgba = rawRgba`). Transferring one buffer twice throws, so send it

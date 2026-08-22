@@ -393,9 +393,13 @@ export const encodeImage = async (bitmap, key, { warmDecoder = true, onWait = nu
 }
 
 /** Clicks in 1024² space: [{ x, y, label }] — 1 include, 0 exclude.
- *  `key` defaults to this tab's last encode. */
-export const decodeMask = (clicks, { key = null, onWait = null } = {}) =>
-    call('decode', { clicks, key }, [], onWait)
+ *  `key` defaults to this tab's last encode.
+ *
+ *  `prior` is the subject-saliency byte map on SAM's own 256² grid, used by
+ *  candidate arbitration. 64 KB structured-cloned per decode, deliberately not
+ *  transferred: the caller reuses the same map for every probe of one image. */
+export const decodeMask = (clicks, { key = null, onWait = null, prior = null } = {}) =>
+    call('decode', { clicks, key, prior }, [], onWait)
 
 /** Report this tab's visibility. Wired to visibilitychange automatically;
  *  exported so tests can drive dormancy without backgrounding a real tab. */

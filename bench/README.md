@@ -47,6 +47,7 @@ Where a user's time actually goes, and why:
 
 | script | what it answers |
 |---|---|
+| `subject.mjs` | **where AI Subject LANDS.** Mask bbox, centre of mass and how far that centre sits from the frame's, per corpus image, plus the per-probe audit (which prompts ran, what each cost, why the winner won). `e2e.mjs` asserts a mask came back; this asserts it came back on the right thing. Run it on both sides of a change and diff the columns. |
 | `workflow.mjs` | **start here.** open → encode → subject → box → click → export, per image, with the lane's own stage breakdown (`encode`/`decode`/`post`, and inside `post`: upsample, bandWidth, bandAlpha, refine, re-threshold) plus the decomposition `refineField` chose. This is what showed `post` outweighing the GPU decode. |
 | `latency.mjs` | pointer→paint latency and frame times during paced 120 Hz drags, plus **draws per frame**. The draw counter is what proved the render effect was already ≤1 draw/frame, so rAF-coalescing it was pure added latency. |
 | `overlay.mjs` | cost of the selection outline when a grade changes — the path where a texture mask's boundary is re-traced per frame. |
@@ -96,3 +97,19 @@ Steady-state selection on a 1756×1024 proxy, warm embedding:
 `encode ~8 ms · decode ~95 ms · post ~134 ms`. `post` is the largest stage, and
 `refine` is ~95 ms of it — so it is bound by full-resolution passes over the frame,
 not by the subsampled solve.
+
+## AI Subject
+
+Probes are decode-only and the post pipeline runs once, on the winner. Warm,
+back to back on the same machine (`subj-rep`-style repetition, median of 6 after
+a discarded cold run):
+
+| image | three full probes | prior probes, one post |
+|---|---|---|
+| `dslr-cover.jpg` 1828×640 | 556 ms | **347 ms** |
+| `2680558334.nef` | 617 ms | **384 ms** |
+
+The accuracy change is the point, though, not the 210–230 ms. On the NEF the old
+frame-box probe won with **89 % coverage** — the whole photograph — because a
+frame-wide box makes `inBox` 1 for every candidate and the ranking loses its only
+positional term. With a prior-derived tight box it lands at 18 %.

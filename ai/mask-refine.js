@@ -43,6 +43,15 @@
  */
 const CHROMA_EPS = 3
 
+// BT.601 luma + chroma. ONE definition: refineRect's fused loop and the plane
+// form below must agree, or the guided filter and the subject prior would be
+// reading different colours off the same pixels.
+const KR = 0.299
+const KG = 0.587
+const KB = 0.114
+const KCB = 0.564
+const KCR = 0.713
+
 // ---------------------------------------------------------------- scratch pool
 // A colour guided filter borrows ~17 typed arrays per call, all at a handful of
 // repeated shapes, and the refine path runs it once per band tile. Pooling them
@@ -408,6 +417,32 @@ export const guidedFilterColor = (p, R, G, B, w, h, o = {}) => {
     return r
 }
 
+/**
+ * Box mean into a CALLER-OWNED array — the SAT and every intermediate go back
+ * to the pool. Exported for passes outside this file (the subject prior's
+ * focus and colour maps) so they do not carry a second box-filter.
+ */
+export const boxMeanInto = (src, w, h, r, out) => {
+    const v = boxMean(src, w, h, r, out)
+    release()
+    return v
+}
+
+/** RGBA → Y/Cb/Cr planes, the transform refineRect feeds gfColor. Caller owns
+ *  the three destination arrays. */
+export const ycbcrPlanes = (rgba, w, h, Y, Cb, Cr) => {
+    const INV255 = 1 / 255
+    for (let i = 0, j = 0; i < w * h; i += 1, j += 4) {
+        const r = rgba[j] * INV255
+        const g = rgba[j + 1] * INV255
+        const b = rgba[j + 2] * INV255
+        const y = KR * r + KG * g + KB * b
+        Y[i] = y
+        Cb[i] = KCB * (b - y)
+        Cr[i] = KCR * (r - y)
+    }
+}
+
 // ------------------------------------------------------------ tiled refinement
 
 /** Logit distance from the crossing beyond which the filter cannot move the
@@ -622,11 +657,11 @@ const refineRect = (field, rgba, w, x0, y0, rw, rh, cx0, cy0, cx1, cy1, o) => {
         for (let x = 0; x < rw; x += 1) {
             const j = (srow + x) << 2
             const r = rgba[j] * INV255, g = rgba[j | 1] * INV255, b = rgba[j | 2] * INV255
-            const Y = 0.299 * r + 0.587 * g + 0.114 * b
+            const Y = KR * r + KG * g + KB * b
             gy[drow + x] = Y
             if (o.color) {
-                cb[drow + x] = 0.564 * (b - Y)
-                cr[drow + x] = 0.713 * (r - Y)
+                cb[drow + x] = KCB * (b - Y)
+                cr[drow + x] = KCR * (r - Y)
             }
         }
     }

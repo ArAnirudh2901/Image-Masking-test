@@ -298,6 +298,7 @@ function App() {
             setImageSize({ width: w, height: h })
             setChain([]); setSelectedId(null); setTool(null); setDraft([])
             putClickPoints([]); setClickMaskId(null); setSamBox(null); setAiLasso(null)
+            setCycleTarget(null)   // a new photo parks nothing
             setHasImage(true)
             const native = `${transform.originalW}×${transform.originalH}`
             setStatus(`${label || 'image'} · ${native} → ${w}×${h} interaction frame${transform.sourceWasRaw ? ' (RAW preview)' : ''}`)
@@ -736,6 +737,12 @@ function App() {
     // texture they reference (brush strokes, AI masks, boundary edits, curve
     // LUTs), so ANY edit is reversible — not just parametric ones. Changes are
     // debounced into history so a drag collapses to a single undo step.
+    // SAM's other granularity candidates for the most recent AI mask:
+    // { layerId, count, index }. Null whenever nothing on screen owns them.
+    const [cycleTarget, setCycleTarget] = useState(null)
+    const cycleTargetRef = useRef(null)
+    cycleTargetRef.current = cycleTarget
+
     const historyRef = useRef({ past: [], present: null, future: [] })
     const histTimerRef = useRef(0)
     const restoringRef = useRef(false)
@@ -877,14 +884,27 @@ function App() {
     // semantic shader samples, at exactly the working canvas's dimensions.
     const commitAiMask = useCallback((res, { label, invert = false, feather = 0.02 } = {}) => {
         const keys = registerTexture(res.canvas)
-        return commit({
+        const id = commit({
             ...semanticLayer({ maskTextureKey: keys.maskTextureKey, feather, label }),
             baseTextureKey: keys.baseTextureKey,
             growPx: 0,
             inverted: invert,
+            // Which of the lane's parked score fields this mask came from. The
+            // adapter holds exactly ONE, and imageKey cannot tell two masks of
+            // the same photo apart, so an export has to prove the field it is
+            // about to matte still belongs to this layer.
+            decodeId: res.decodeId || 0,
             ...newFillProps('semantic'),
         })
+        // SAM computed three granularity candidates for this prompt and they are
+        // already in memory. Arm the cycling control on the layer that owns them
+        // — a later selection parks its own set and takes the arming with it.
+        setCycleTarget(res.candidates && res.candidates.count > 1
+            ? { layerId: id, count: res.candidates.count, index: res.candidates.index }
+            : null)
+        return id
     }, [commit])
+
 
     // One place where every AI tool's async lifecycle lives: busy latch, stale
     // guard, engine-status refresh and error surface. Tools describe the run;
@@ -909,15 +929,57 @@ function App() {
         }
     }, [aiSet])
 
+    /**
+     * Step to SAM's next / previous candidate for the selected AI mask.
+     *
+     * Arbitration picks the best default, but a first click on a genuinely
+     * ambiguous subject has no single right answer — "the petal" and "the bloom"
+     * are both correct for one point on a rose — and the subject prior can pick
+     * the right OBJECT at the wrong scope. The other two planes are already in
+     * memory, so this is a repaint, not a decode.
+     */
+    const cycleMask = useCallback(async (delta) => {
+        const target = cycleTargetRef.current
+        if (!target || aiBusyRef.current) return
+        const entry = chainRef.current.find((e) => e.layer.id === target.layerId)
+        if (!entry) { setCycleTarget(null); return }
+        const res = await runAi('Trying SAM\u2019s next candidate\u2026', (mod) => mod.cycleMask(delta))
+        if (!res) return
+        const l = entry.layer
+        if (l.maskTextureKey) setMaskTexture(l.maskTextureKey, res.canvas)
+        // Re-base the boundary grow/shrink origin, same as a click-select refine.
+        if (l.baseTextureKey) {
+            const snap = document.createElement('canvas'); snap.width = W; snap.height = H
+            snap.getContext('2d').drawImage(res.canvas, 0, 0)
+            setMaskTexture(l.baseTextureKey, snap)
+        }
+        // The layer change plus bump() are what push the undo entry: the history
+        // effect snapshots textures whose version moved, and setMaskTexture
+        // moved both of these.
+        updateLayer(l.id, { growPx: 0, decodeId: res.decodeId || 0 })
+        const c = res.candidates
+        setCycleTarget(c && c.count > 1 ? { layerId: l.id, count: c.count, index: c.index } : null)
+        bump()
+        aiSet({ status: `Candidate ${(c?.index ?? 0) + 1} of ${c?.count ?? 1} — ${(res.coverage * 100).toFixed(0)}% coverage · [ and ] cycle` })
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runAi, updateLayer, aiSet, W, H])
+
     // AI Subject / AI Sky·Background — the same mask, inverted for the second.
-    // See studio-bridge.selectSubject for why this is three decoder probes over
-    // one cached encode rather than a saliency model.
+    // See studio-bridge.selectSubject: prompts come from a pixel-statistics
+    // prior, every probe is decode-only, and the post pipeline runs once.
     const runSubject = useCallback(async ({ invert = false } = {}) => {
         const noun = invert ? 'Background' : 'Subject'
         const res = await runAi(`AI ${noun}: segmenting…`, (mod, canvas) => mod.selectSubject(canvas))
         if (!res) return
         commitAiMask(res, { label: invert ? 'AI Sky / Background' : 'AI Subject', invert })
-        aiSet({ status: `${noun} masked — SAM 2.1 (${res.probe}, ${(res.coverage * 100).toFixed(0)}% coverage, ${res.ms} ms)${invert ? ' → inverted = the entire sky / background' : ''}` })
+        // Per-probe audit for bench/subject.mjs — which prompts ran, what each
+        // cost, and why the winner won. Debug surface only; nothing reads it.
+        if (typeof window !== 'undefined' && res.probes) {
+            window.__lastSubject = { probes: res.probes, postMs: res.postMs, won: res.probe }
+        }
+        aiSet({ status: `${noun} masked — SAM 2.1 (${res.probe}, ${(res.coverage * 100).toFixed(0)}% coverage, ${res.ms} ms)`
+            + (invert ? ' → inverted = the entire sky / background' : '')
+            + ((res.candidates?.count || 0) > 1 ? ' · wrong scope? press [ or ]' : '') })
     }, [runAi, commitAiMask, aiSet])
 
     // AI Box-Select — drag a box, SAM returns the object inside it.
@@ -1124,10 +1186,22 @@ function App() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [chain, baseLayer, tick])
 
-    // ⌘/Ctrl+Z undo · ⌘/Ctrl+Shift+Z (or Ctrl+Y) redo.
+    // ⌘/Ctrl+Z undo · ⌘/Ctrl+Shift+Z (or Ctrl+Y) redo · [ / ] cycle candidates.
+    // Through a ref so the binding is installed once: cycleMask closes over the
+    // chain, and re-registering a window listener per keystroke-worth of state
+    // is how a repaint turns into a leak.
+    const cycleMaskRef = useRef(cycleMask)
+    cycleMaskRef.current = cycleMask
     useEffect(() => {
         const onKey = (e) => {
-            if (!(e.metaKey || e.ctrlKey)) return
+            if (!(e.metaKey || e.ctrlKey)) {
+                if (e.key !== '[' && e.key !== ']') return
+                const t = e.target
+                if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return
+                e.preventDefault()
+                cycleMaskRef.current(e.key === '[' ? -1 : 1)
+                return
+            }
             const k = e.key.toLowerCase()
             if (k === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo() }
             else if (k === 'y') { e.preventDefault(); redo() }
@@ -1367,6 +1441,8 @@ function App() {
             select: (id) => setSelectedId(id),
             expandBoundary: (id, px) => onExpandBoundary(id, px),
             refine: () => startRefine(),
+            cycle: (delta = 1) => cycleMask(delta),
+            candidates: () => cycleTarget,
             runSubject: () => runSubject(),
             background: () => runSubject({ invert: true }),
             samBox: (x0, y0, x1, y1) => onSamBox([x0, y0, x1, y1]),
@@ -1388,11 +1464,48 @@ function App() {
             },
             // Renderer counters — program-cache hit rate, compile time, draw
             // count. The only way to tell a shader recompile from a slow draw.
+            // Where a mask actually LANDED, for the subject-accuracy bench. A
+            // status line reports coverage; only the bbox and centroid can say
+            // whether the mask is on the subject or on a corner of the frame.
+            maskStats: (id) => {
+                const l = (id ? chainRef.current.find((e) => e.layer.id === id)
+                    : chainRef.current[chainRef.current.length - 1])?.layer
+                const tex = l && getMaskTexture(l.maskTextureKey)
+                if (!tex || !tex.width) return null
+                const c = document.createElement('canvas'); c.width = W; c.height = H
+                c.getContext('2d').drawImage(tex, 0, 0, W, H)
+                const d = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data
+                let n = 0; let sx = 0; let sy = 0
+                let x0 = W; let y0 = H; let x1 = -1; let y1 = -1
+                for (let y = 0; y < H; y += 1) {
+                    for (let x = 0; x < W; x += 1) {
+                        if (d[(y * W + x) * 4] < 128) continue
+                        n += 1; sx += x; sy += y
+                        if (x < x0) x0 = x
+                        if (x > x1) x1 = x
+                        if (y < y0) y0 = y
+                        if (y > y1) y1 = y
+                    }
+                }
+                if (!n) return { id: l.id, coverage: 0 }
+                return {
+                    id: l.id,
+                    w: W,
+                    h: H,
+                    coverage: +(n / (W * H)).toFixed(4),
+                    bbox: [x0, y0, x1, y1],
+                    centroid: [Math.round(sx / n), Math.round(sy / n)],
+                    // Fraction of the frame's diagonal between the mask's centre
+                    // of mass and the frame's — the single number that separated
+                    // "the sphere" from "the top-left fold".
+                    offCentre: +(Math.hypot(sx / n - W / 2, sy / n - H / 2) / Math.hypot(W / 2, H / 2)).toFixed(3),
+                }
+            },
             renderMetrics: () => getRenderMetrics(),
             resetRenderMetrics: () => resetRenderMetrics(),
         }
         window.__ready = true
-    }, [imageSize, chain, baseLayer, W, H, commit, updateLayer, setFillMode, applyCurve, onExpandBoundary, ai, runSubject, testDevice, exportHd, onSamBox, onAiLasso, onClickSelect, clickPoints, undo, redo, startRefine])
+    }, [imageSize, chain, baseLayer, W, H, commit, updateLayer, setFillMode, applyCurve, onExpandBoundary, ai, runSubject, testDevice, exportHd, onSamBox, onAiLasso, onClickSelect, clickPoints, undo, redo, startRefine, cycleMask, cycleTarget])
 
     // Engine chip: what the lane actually resolved to, never what it intends to
     // use. Stays "starting…" until a session exists.
@@ -1419,6 +1532,9 @@ function App() {
     // masks (radial / linear / pen / lasso) are edited via their handles instead.
     const canRefine = !!selected && ['semantic', 'brush', 'smartBrush'].includes(selected.layer.kind)
         && !!(selected.layer.maskTextureKey || selected.layer.brushTextureKey)
+    // The lane parks ONE candidate set, so cycling is offered only on the layer
+    // that owns it — anything else would repaint a mask with another one's planes.
+    const canCycle = !!cycleTarget && selectedId === cycleTarget.layerId
 
     /* ── render ────────────────────────────────────────────────────────── */
     return (
@@ -1608,6 +1724,16 @@ function App() {
                                     title={canRefine ? 'Paint on the selected mask to add / erase coverage (Alt-drag to erase)' : 'Select an AI Subject or brush mask to refine it'}
                                 >
                                     ✎ {tool === 'refine' ? 'Refining selected mask…' : 'Brush-refine selected mask'}
+                                </button>
+                            )}
+                            {canCycle && (
+                                <button
+                                    className="mask-btn"
+                                    disabled={ai.busy}
+                                    onClick={() => cycleMask(1)}
+                                    title="SAM returns three nested answers (part / object / whole). Step through them — no re-decode. Keyboard: [ and ]"
+                                >
+                                    ⇄ Next mask scope ({cycleTarget.index + 1}/{cycleTarget.count}) · [ ]
                                 </button>
                             )}
                             {chain.length === 0 ? (

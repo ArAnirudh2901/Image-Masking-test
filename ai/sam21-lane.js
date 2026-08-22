@@ -936,7 +936,7 @@ const gpuTensor = (ort, buffer, dims) =>
  * Logits, not a thresholded mask: §10 upsamples the continuous field and runs a
  * guided filter, which is where boundary quality actually comes from.
  */
-export const decode = async ({ clicks = [], key, sid = null }) => {
+export const decode = async ({ clicks = [], key, sid = null, prior = null }) => {
     const embed = state.embeds.get(key)
     // Explicit key, never "whatever is resident": with one instance across tabs
     // the latest encode is not necessarily this tab's image.
@@ -947,7 +947,7 @@ export const decode = async ({ clicks = [], key, sid = null }) => {
     state.idleTimer = null
     state.decodeRefs += 1
     try {
-        return await runDecode(embed, clicks, key, sid)
+        return await runDecode(embed, clicks, key, sid, prior)
     } finally {
         state.decodeRefs -= 1
         noteRun()   // WebKit inference-count guard; no-op on Chromium
@@ -1038,7 +1038,7 @@ const priorMask = (key, sid, n) =>
 /** Forget the continuity anchor (image swap, eviction, device loss). */
 export const forgetPick = (key) => { if (!key || lastPick?.key === key) lastPick = null }
 
-const runDecode = async (embed, clicks, key, sid) => {
+const runDecode = async (embed, clicks, key, sid, prior = null) => {
     embed.usedAt = performance.now()
     const t0 = performance.now()
     const ort = state.ort ??= await loadOrt()
@@ -1054,14 +1054,18 @@ const runDecode = async (embed, clicks, key, sid) => {
         labels[i] = pts[i].label ?? 1
     }
 
-    const prior = priorMask(key, sid, n)
+    // Two different "priors" meet here, so neither keeps the bare name: the
+    // continuity anchor is the mask this caller was last shown, and `prior` (the
+    // parameter) is the subject-saliency map.
+    const priorMaskPlane = priorMask(key, sid, n)
     const first = await decodePass(ort, session, embed, coords, labels, n, null)
 
     // Arbitration, not argmax — see mask-select.js for why predicted IoU alone
     // gets the nested / negative-click / box cases wrong.
     const sel = chooseCandidate({
         planes: first.planes, scores: first.scores, clicks: pts,
-        side: MASK_SIDE, scale: GRID, previous: prior, minAgree: REFINE_MIN_AGREE,
+        side: MASK_SIDE, scale: GRID, previous: priorMaskPlane, minAgree: REFINE_MIN_AGREE,
+        prior,
     })
     let chosen = first.planes[sel.index]
     let index = sel.index
@@ -1085,6 +1089,7 @@ const runDecode = async (embed, clicks, key, sid) => {
         const r = chooseCandidate({
             planes: second.planes, scores: second.scores, clicks: pts,
             side: MASK_SIDE, scale: GRID, previous: chosen, minAgree: REFINE_MIN_AGREE,
+            prior,
         })
         if (r.reason === 'agree') {
             chosen = second.planes[r.index]

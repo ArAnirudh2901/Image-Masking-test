@@ -140,6 +140,10 @@ const boxCells = (box, side, scale) => (box ? [
     clampi(Math.round(box[3] * scale), side - 1),
 ] : null)
 
+/** Width of the frame's outer ring, in cells — 3 % of the grid. A mask that
+ *  lives mostly in here is the background, whatever its predicted IoU says. */
+const borderCells = (side) => Math.max(1, Math.round(side * 0.03))
+
 /**
  * Every per-plane statistic arbitration needs, in ONE traversal.
  *
@@ -152,28 +156,39 @@ const boxCells = (box, side, scale) => (box ? [
  * Row-major, so the box test is a range check per row instead of a modulo and a
  * divide per cell.
  */
-const planeStats = (field, side, cells, previous) => {
+const planeStats = (field, side, cells, previous, prior = null) => {
     const bx0 = cells ? cells[0] : 0
     const by0 = cells ? cells[1] : 0
     const bx1 = cells ? cells[2] : side - 1
     const by1 = cells ? cells[3] : side - 1
+    // The prior is a byte map on this exact grid or it is not used at all — a
+    // mismatched length would silently score against the wrong cells.
+    const sal = prior && prior.length === side * side ? prior : null
     let hi = 0
     let lo = 0
     let area = 0
     let inside = 0
     let inter = 0
     let union = 0
+    let salSum = 0
+    let salAll = 0
+    let border = 0
+    const bp = borderCells(side)
     for (let y = 0; y < side; y += 1) {
         const row = y * side
         const inRow = y >= by0 && y <= by1
+        const yEdge = y < bp || y >= side - bp
         for (let x = 0; x < side; x += 1) {
             const v = field[row + x]
             if (v > T + 1) hi += 1
             if (v > T - 1) lo += 1
+            if (sal) salAll += sal[row + x]
             const on = v > T
             if (on) {
                 area += 1
                 if (inRow && x >= bx0 && x <= bx1) inside += 1
+                if (sal) salSum += sal[row + x]
+                if (yEdge || x < bp || x >= side - bp) border += 1
             }
             if (previous) {
                 const was = previous[row + x] > T
@@ -181,11 +196,21 @@ const planeStats = (field, side, cells, previous) => {
             }
         }
     }
+    // Mean saliency inside the mask is precision, and precision alone is
+    // maximised by the smallest hottest blob — the roof, never the tram. Paired
+    // with recall (share of the map's mass captured) as a harmonic mean, so a
+    // fragment and the whole frame lose for opposite reasons.
+    const salPrec = area ? salSum / (area * 255) : 0
+    const salRec = salAll ? salSum / salAll : 0
     return {
         stability: lo ? hi / lo : 0,
         area,
+        coverage: area / (side * side),
         inBox: cells ? (area ? inside / area : 1) : 1,
         agree: previous ? (union ? inter / union : 0) : 0,
+        // 1 with no prior, so click- and box-select rank exactly as before.
+        salienceFit: sal ? (salPrec + salRec > 0 ? (2 * salPrec * salRec) / (salPrec + salRec) : 0) : 1,
+        borderFrac: area ? border / area : 0,
     }
 }
 
@@ -200,6 +225,7 @@ const planeStats = (field, side, cells, previous) => {
  * obviously-wrong.
  */
 const rank = (s) => s.score * (0.5 + 0.5 * s.stability) * (0.3 + 0.7 * s.inBox)
+    * (0.3 + 0.7 * s.salienceFit)
 
 /**
  * Pick one of SAM's candidates.
@@ -221,11 +247,12 @@ const rank = (s) => s.score * (0.5 + 0.5 * s.stability) * (0.3 + 0.7 * s.inBox)
  */
 export const chooseCandidate = ({
     planes, scores = [], clicks = [], side, scale, previous = null, minAgree = 0.5,
+    prior = null,
 }) => {
     const cells = boxCells(boxFromClicks(clicks), side, scale)
     const stats = planes.map((p, i) => {
         const fit = promptFit(p, side, clicks, scale)
-        const s = planeStats(p, side, cells, previous)
+        const s = planeStats(p, side, cells, previous, prior)
         return {
             i,
             violations: fit.miss + fit.leak,
@@ -236,6 +263,7 @@ export const chooseCandidate = ({
             area: s.area,
             score: scores[i] ?? 0,
             agree: s.agree,
+            salienceFit: s.salienceFit,
         }
     })
 
@@ -254,6 +282,21 @@ export const chooseCandidate = ({
     for (const s of pool) if (rank(s) > rank(best)) best = s
     return { index: best.i, reason: minV > 0 ? 'least-violation' : 'rank', stats, pick: best }
 }
+
+/**
+ * Whole-field statistics for choosing among PROBES — different prompts against
+ * the same image — as opposed to among the three candidates of one decode.
+ *
+ * The two questions need different numbers. Candidate arbitration asks "which
+ * granularity did the user mean", so it leans on prompt consistency and box
+ * agreement. Probe arbitration asks "which prompt found the subject at all", so
+ * it needs coverage (is this a speck or the whole photo), border occupancy (is
+ * this the background wearing a mask's clothes) and salience — and it needs
+ * them BEFORE the post pipeline runs, because the whole point of ranking here
+ * is that only the winner pays for upsample + guided filter + hygiene.
+ */
+export const probeStats = (field, side, prior = null) =>
+    planeStats(field, side, null, null, prior)
 
 /* ── 4-connected components, as scanline runs ─────────────────────────────────
  * Runs plus union-find, not a flood fill.

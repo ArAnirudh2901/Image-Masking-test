@@ -65,7 +65,8 @@ const cropCaps = (budget, { fullRes = false } = {}) => {
 // filter-only. A frame-filling crop is already at the proxy ceiling, so it skips
 // the decode. Returns null when the job went stale.
 const decodeCropAlpha = async (proxyMask, prompts, rect, tf, {
-    budget, revision, forceDecode = false, nativeCrop = false, compose = false, emitBlob = false, caps = null,
+    budget, revision, decodeId = null,
+    forceDecode = false, nativeCrop = false, compose = false, emitBlob = false, caps = null,
 }) => {
     const p2o = tf.originalW / tf.proxyW
     const frameArea = tf.originalW * tf.originalH
@@ -108,6 +109,10 @@ const decodeCropAlpha = async (proxyMask, prompts, rect, tf, {
         upFactor,
         compose,
         emitBlob,
+        // Which parked field this mask came from. The lane holds ONE, and
+        // imageKey cannot tell two masks of the same photo apart, so without
+        // this an export happily mattes whichever selection ran last.
+        decodeId,
     })
     if (res.stale) return null
     return {
@@ -193,14 +198,14 @@ const cropVsProxyIoU = (proxyMask, crop) => {
  * can merge it back into the proxy mask. null = no-op (no original, empty
  * mask, or the re-decode was IoU-rejected / went stale) — the proxy stands.
  */
-export const escalateCrop = async (proxyMask, prompts, { budget, revision } = {}) => {
+export const escalateCrop = async (proxyMask, prompts, { budget, revision, decodeId = null } = {}) => {
     if (!hasOriginal()) return null
     const tf = getTransform()
     if (!tf) return null
     const summary = summarizeMaskRGBA(proxyMask.data, proxyMask.width, proxyMask.height)
     if (!summary.bbox) return null
     const rect = cropRectFromBBox(summary.bbox, tf)
-    const crop = await decodeCropAlpha(proxyMask, prompts, rect, tf, { budget, revision, forceDecode: true })
+    const crop = await decodeCropAlpha(proxyMask, prompts, rect, tf, { budget, revision, decodeId, forceDecode: true })
     if (!crop || !crop.decoded) return null
     // The re-decode is a SECOND opinion from a model that has never seen the
     // rest of the frame, so it can land on a different object (measured: a
@@ -223,7 +228,7 @@ export const escalateCrop = async (proxyMask, prompts, { budget, revision } = {}
  *  canvas (default, used by the test hook) or a worker-encoded blob (emitBlob,
  *  the download path). null when no original is held so the caller falls back to
  *  the proxy export. */
-export const buildCutout = async (proxyMask, prompts, { budget, revision, preserveShape = false, emitBlob = false } = {}) => {
+export const buildCutout = async (proxyMask, prompts, { budget, revision, decodeId = null, preserveShape = false, emitBlob = false } = {}) => {
     if (!hasOriginal()) return null
     const tf = getTransform()
     if (!tf) return null
@@ -247,7 +252,7 @@ export const buildCutout = async (proxyMask, prompts, { budget, revision, preser
     // path the worker also encodes the PNG and returns a blob, keeping the main
     // thread flat; the test hook takes the buffer and builds a canvas.
     const crop = await decodeCropAlpha(proxyMask, prompts, rect, tf, {
-        budget, revision, nativeCrop: true, compose: true, emitBlob, caps: cropCaps(budget, { fullRes: true }),
+        budget, revision, decodeId, nativeCrop: true, compose: true, emitBlob, caps: cropCaps(budget, { fullRes: true }),
     })
     if (!crop) return null
     // Decoded below the crop native width means a resolution cap applied (bounded

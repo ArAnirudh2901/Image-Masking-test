@@ -91,7 +91,7 @@ const readGuide = (canvas, w, h) => {
  * candidate parking in sam21-adapter keeps the caller's plane for cycling.
  * Resolves null when the worker could not serve it — run postCompute yourself.
  */
-export const postAsync = ({ canvas, imageKey, logits, w, h, maskSide, clicks = [], tight = false }) => {
+export const postAsync = ({ canvas, imageKey, logits, w, h, maskSide, clicks = [], tight = false, fit = null }) => {
     const wk = getWorker()
     if (!wk) return Promise.resolve(null)
 
@@ -127,6 +127,7 @@ export const postAsync = ({ canvas, imageKey, logits, w, h, maskSide, clicks = [
                 maskSide,
                 clicks,
                 tight,
+                fit,
             }, transfer)
         } catch (err) {
             clearTimeout(timer)

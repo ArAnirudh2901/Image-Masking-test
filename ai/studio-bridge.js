@@ -24,8 +24,9 @@ import { probeCapability } from './capability.js'
 import { createMemoryGovernor } from './memory-governor.js'
 import { clearHeavyQueue, getHeavyQueueState } from './heavy-job-queue.js'
 import {
-    cancelBefore, clientState, encodeImage, encoderReady, forgetEncoder, relievePressure,
-    releaseDocument, releaseEmbeddings, segment, subscribe, warmEncoder, warmUp,
+    cancelBefore, clientState, cycleCandidate, encodeImage, encoderReady, finishDecode,
+    forgetEncoder, relievePressure, releaseDocument, releaseEmbeddings, segment, subscribe,
+    warmEncoder, warmUp,
 } from './sam-client.js'
 import {
     getOriginalForExport, getTransform, hasOriginal, importOriginal, releaseAsset,
@@ -34,7 +35,9 @@ import { extractRawPreview, isRawFile } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { disposeCvRefine } from './cv-refine-client.js'
 import { dropMaskPostGuide } from './mask-post-client.js'
-import { clearGuideCache } from './sam21-adapter.js'
+import { clearGuideCache, sam21Candidates } from './sam21-adapter.js'
+import { probeStats } from './mask-select.js'
+import { computeSubjectPrior } from './subject-prior.js'
 import { composeChannels, dilateChannel, lassoToPrompts, maskToChannel } from './sam-core.js'
 import { modelRegistry } from './model-registry.js'
 
@@ -56,6 +59,7 @@ const state = {
     hasImage: false,
     proxyCanvas: null,
     lastPrompts: null,   // proxy-space prompts behind the live mask (HD export)
+    prior: null,         // { key, value } — the subject prior for this image
 }
 
 /** Subscribe to engine events: {type:'progress'|'state'|'waiting'|'pressure'}. */
@@ -362,6 +366,7 @@ export const importImage = async (source, { proxyCanvas, onStage = () => {} }) =
     state.hasImage = true
     state.proxyCanvas = proxyCanvas
     state.lastPrompts = null
+    state.prior = null
     noteInteraction()
     trace('import', { proxy: `${transform.proxyW}×${transform.proxyH}`, original: `${transform.originalW}×${transform.originalH}`, raw })
 
@@ -380,6 +385,7 @@ export const releaseImage = () => {
     state.hasImage = false
     state.proxyCanvas = null
     state.lastPrompts = null
+    state.prior = null
     clearHeavyQueue()
     releaseAsset()
     releaseDocument()
@@ -428,19 +434,43 @@ const finish = (res, imageData, extra = {}) => {
         // Stage breakdown. `ms` alone cannot tell a slow encode from a slow refine,
         // which is the only question worth asking when a selection feels sluggish.
         stages: res.stages || null,
+        // SAM's other granularity candidates, and which parked field this mask
+        // came from. Both travel onto the layer: the first drives the cycling
+        // control, the second is what lets an export prove the field it is about
+        // to matte still belongs to the mask on screen.
+        candidates: res.candidates || null,
+        decodeId: res.decodeId ?? 0,
         ...extra,
     }
 }
+
+/** What hardware-fit currently believes about this device's post throughput.
+ *  The post pipeline uses it to decide whether the edge-faithful guided-filter
+ *  settings fit inside one click's latency budget. */
+const postFit = () => ({
+    budgetMs: BUDGET.postBudgetMs || 0,
+    msPerMP: BUDGET.postMsPerMP || 0,
+})
 
 /**
  * One selection against the ≤proxy working canvas. Coordinates are canvas
  * pixels — the same space the React app draws its handles in — so no mapping
  * happens above this line.
  *
+ * `decodeOnly` returns the raw 256² probe instead of a mask: no post pipeline,
+ * and nothing published. `record` is what keeps a probe from overwriting the
+ * prompts behind the LIVE mask — `state.lastPrompts` is read by the HD export
+ * path, and writing it unconditionally meant a multi-probe AI Subject left the
+ * LAST probe's prompts there rather than the winner's, so an export re-decoded
+ * a different prompt than the mask on screen.
+ *
  * @param {HTMLCanvasElement} canvas
  * @param {{ clicks?: Array<[number,number,0|1]>, box?: number[], lasso?: Array<[number,number]> }} prompts
+ * @param {{ decodeOnly?: boolean, record?: boolean, prior?: Uint8Array|null }} opts
  */
-export const select = async (canvas, prompts = {}) => {
+export const select = async (canvas, prompts = {}, {
+    decodeOnly = false, record = true, prior = null,
+} = {}) => {
     let clicks = prompts.clicks ? prompts.clicks.slice() : []
     let box = prompts.box || null
     let clamp = null
@@ -455,46 +485,178 @@ export const select = async (canvas, prompts = {}) => {
     if (!clicks.length && !box) return { stale: false, usable: false, reason: 'nothing to select with' }
 
     const rev = state.revision
-    const res = await segment(canvas, { clicks, box, revision: rev })
+    const res = await segment(canvas, { clicks, box, revision: rev, prior, fit: postFit(), decodeOnly })
     if (res.stale || rev !== state.revision) return { stale: true }
+    if (res.decodeOnly) return { stale: false, ...res, prompts: { clicks, box } }
     if (!res.usable) return { stale: false, usable: false, reason: res.reason, score: res.score }
 
     const field = clamp ? clampToPolygon(res.imageData, clamp.poly, clamp.margin) : res.imageData
-    state.lastPrompts = { clicks, box, clampPoly: clamp?.poly || null, clampMargin: clamp?.margin || 0 }
+    if (record) {
+        state.lastPrompts = { clicks, box, clampPoly: clamp?.poly || null, clampMargin: clamp?.margin || 0 }
+    }
     return finish(res, field)
 }
 
 /**
- * "The subject", with no saliency model in the lane. SAM 2.1 emits three
- * granularity candidates and mask-select already rejects whole-scene runaways;
- * what it cannot do is guess which prompt means "the main thing". So probe with
- * the three prompts that disagree usefully — a frame-bounding box (extent), a
- * centre click (position), and both together — and keep the best usable result
- * that still leaves a background behind. The encoder runs ONCE (the embedding is
- * content-keyed and cached), so probes two and three are decoder passes only.
+ * Run the post pipeline on a winning probe and publish it as the live mask.
+ * The single place `state.lastPrompts` is set for a multi-probe selection, so
+ * the prompts behind the mask and the prompts an export re-decodes are the
+ * same by construction rather than by ordering.
+ */
+const finishSelect = async (winner) => {
+    const rev = state.revision
+    const res = await finishDecode(winner.probe, { revision: rev })
+    if (res.stale || rev !== state.revision) return { stale: true }
+    if (!res.usable) return { stale: false, usable: false, reason: res.reason, score: res.score }
+    state.lastPrompts = {
+        clicks: winner.prompts.clicks || [],
+        box: winner.prompts.box || null,
+        clampPoly: null,
+        clampMargin: 0,
+    }
+    return finish(res, res.imageData, { probe: winner.name, rank: +winner.rank.toFixed(4) })
+}
+
+/** The subject prior for the current image, computed once and kept. It is a
+ *  function of the pixels alone, so it survives every selection on that photo. */
+const subjectPrior = (canvas) => {
+    const key = state.importEpoch
+    if (state.prior && state.prior.key === key) return state.prior.value
+    const value = computeSubjectPrior(canvas)
+    state.prior = { key, value }
+    trace('subject-prior', value
+        ? { box: value.box.map(Math.round), points: value.points.length, coverage: +value.coverage.toFixed(3) }
+        : 'none — falling back to the frame probes')
+    return value
+}
+
+/**
+ * "The subject."
+ *
+ * This used to probe SAM with three fixed prompts, the strongest of which was a
+ * box inset 4 % from the frame edge — which is "select the whole photo" written
+ * as a box. Arbitration ranks partly by `inBox`, so a frame-wide box makes that
+ * term 1 for every candidate and the ranking has no positional signal at all:
+ * any blob passing the coverage gate could win, and on a shallow-DOF macro shot
+ * one did, in the top-left corner.
+ *
+ * So the prompts are derived from the pixels first (subject-prior.js), and the
+ * box handed to SAM is TIGHT — which is what turns `inBox` back into a real
+ * discriminator. The frame probe survives only as the fallback for a scene with
+ * no readable subject.
+ *
+ * Every probe is DECODE-ONLY. The encoder runs once (the embedding is
+ * content-keyed and cached) and the ~134 ms post pipeline runs once, on the
+ * winner — ranking happens in SAM's native 256² logit space, which is where
+ * arbitration already works.
  */
 export const selectSubject = async (canvas) => {
     const W = canvas.width
     const H = canvas.height
-    const inset = [W * 0.04, H * 0.04, W * 0.96, H * 0.96]
-    const probes = [
-        { name: 'centre+frame', clicks: [[W / 2, H / 2, 1]], box: inset },
-        { name: 'frame', box: inset },
-        { name: 'centre', clicks: [[W / 2, H / 2, 1]] },
-    ]
-    let best = null
-    for (const probe of probes) {
-        const r = await select(canvas, probe)
-        if (r.stale) return r
-        if (!r.usable) continue
-        // Below 1% is a speck, above 92% is the whole photo — neither is "the
-        // subject". Near-runaways still count, but rank below a scoped answer.
-        if (r.coverage < 0.01 || r.coverage > 0.92) continue
-        const rank = (r.score || 0) - (r.coverage > 0.8 ? 0.25 : 0)
-        if (!best || rank > best.rank) best = Object.assign(r, { rank, probe: probe.name })
+    const prior = subjectPrior(canvas)
+    const grid = prior?.grid256 || null
+    const click = (p, label = 1) => [p[0], p[1], label]
+
+    const primary = prior ? [
+        // Extent AND position, from the same evidence: the tight box says where
+        // the object ends, the peak says which object.
+        { name: 'prior-box', box: prior.box, clicks: [click(prior.points[0])] },
+        // Several parts of the subject, plus two explicit "this is background"
+        // points — the one prompt shape that can pull a mask off the backdrop.
+        {
+            name: 'prior-points',
+            clicks: [...prior.points.map((p) => click(p)), ...prior.negatives.map((p) => click(p, 0))],
+        },
+        // No box: the box is a prior, not a fact, and a subject that runs past
+        // it is better served by the peak alone.
+        { name: 'prior-point', clicks: [click(prior.points[0])] },
+    ] : []
+    // The old behaviour, kept as the floor: a flat scene has no subject to
+    // locate, and one frame-wide probe is still better than refusing.
+    const fallback = [{
+        name: 'centre+frame',
+        clicks: [[W / 2, H / 2, 1]],
+        box: [W * 0.04, H * 0.04, W * 0.96, H * 0.96],
+    }]
+
+    let stale = false
+    // Per-probe cost and verdict. "AI Subject picked the wrong thing" is
+    // unanswerable without it: the interesting question is always which prompts
+    // were even in the running.
+    const audit = []
+    const run = async (list) => {
+        let best = null
+        for (const probe of list) {
+            const t0 = performance.now()
+            const r = await select(canvas, probe, { decodeOnly: true, record: false, prior: grid })
+            if (r.stale) { stale = true; return null }
+            const ms = +(performance.now() - t0).toFixed(1)
+            if (!r.decodeOnly || !r.logits) { audit.push({ name: probe.name, ms, rejected: 'no-logits' }); continue }
+            const st = probeStats(r.logits, r.side, grid)
+            // Below 1 % is a speck, above 92 % is the whole photo — neither is
+            // "the subject".
+            if (st.coverage < 0.01 || st.coverage > 0.92) {
+                audit.push({ name: probe.name, ms, coverage: +st.coverage.toFixed(3), rejected: 'coverage' })
+                continue
+            }
+            // Predicted IoU stays the backbone, discounted by what it cannot
+            // see. `salienceFit` is unfloored here on purpose: unlike candidate
+            // arbitration, which chooses among three answers to the SAME prompt,
+            // this is choosing between prompts, and a prompt that landed off the
+            // subject entirely should be able to lose outright.
+            const rank = (r.score || 0) * (0.5 + 0.5 * st.stability)
+                * st.salienceFit * (1 - 0.5 * st.borderFrac)
+            audit.push({
+                name: probe.name,
+                ms,
+                decodeMs: r.decodeMs,
+                coverage: +st.coverage.toFixed(3),
+                salienceFit: +st.salienceFit.toFixed(3),
+                borderFrac: +st.borderFrac.toFixed(3),
+                rank: +rank.toFixed(4),
+            })
+            if (!best || rank > best.rank) {
+                best = { probe: r, prompts: r.prompts, name: probe.name, rank, stats: st }
+            }
+        }
+        return best
     }
-    return best || { stale: false, usable: false, reason: 'no subject stood out — try Click-Select or Box-Select' }
+
+    let best = await run(primary)
+    if (stale) return { stale: true }
+    if (!best) {
+        best = await run(fallback)
+        if (stale) return { stale: true }
+    }
+    if (!best) return { stale: false, usable: false, reason: 'no subject stood out — try Click-Select or Box-Select' }
+    const tPost = performance.now()
+    const out = await finishSelect(best)
+    if (!out.stale && out.usable) {
+        out.probes = audit
+        out.postMs = +(performance.now() - tPost).toFixed(1)
+        trace('subject', { probes: audit, won: best.name, postMs: out.postMs })
+    }
+    return out
 }
+
+/**
+ * Step to SAM's next / previous granularity candidate for the mask on screen.
+ *
+ * The planes are already in memory — this is a repaint, not a decode — but
+ * nothing above this module could reach them, so the two other answers SAM
+ * computed for every click were unreachable from the UI. When the prior picks
+ * the right object at the wrong SCOPE, this is the one-keypress fix.
+ */
+export const cycleMask = async (delta = 1) => {
+    const res = await cycleCandidate(delta)
+    if (!res) return null
+    if (res.stale) return { stale: true }
+    if (!res.usable) return { stale: false, usable: false, reason: res.reason }
+    return finish(res, res.imageData, { cycled: true })
+}
+
+/** How many candidates are parked for the live mask, and which one is showing. */
+export const maskCandidates = () => sam21Candidates()
 
 /** Proxy-space prompts behind the live mask — what export-hd maps to the crop. */
 export const currentPrompts = () => (state.lastPrompts ? { ...state.lastPrompts } : { clicks: [], box: null })

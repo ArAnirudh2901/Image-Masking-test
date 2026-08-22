@@ -15,7 +15,7 @@ import { SIDE, MASK_SIDE, LANE } from './sam21-lane.js'
 import { decodeMask, encodeImage, hello, hostMode } from './sam21-client.js'
 import { noteModel } from './model-registry.js'
 import { bandAlpha, refineField } from './mask-refine.js'
-import { bandWidth, postCompute, upsampleLogits as upsampleField } from './mask-post-core.js'
+import { buildEdgeMap, bandWidth, postCompute, upsampleLogits as upsampleField } from './mask-post-core.js'
 import { postAsync, unpackPost } from './mask-post-client.js'
 import { fieldArea } from './mask-select.js'
 
@@ -29,7 +29,9 @@ const upsampleLogits = (logits, w, h) => upsampleField(logits, w, h, MASK_SIDE)
  * [x, y, label] triples in ITS pixel space. Returns the shape sam-client's tail
  * (summarize → validate → emit) consumes.
  */
-export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) => {
+export const sam21Segment = async ({
+    canvas, imageKey, clicks, box, onWait, prior = null, fit = null, decodeOnly = false,
+}) => {
     if (!greeted) { await hello('seglab'); greeted = true }
     const t0 = performance.now()
 
@@ -98,7 +100,7 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
     const t1 = performance.now()
     let dec
     try {
-        dec = await decodeMask(pts, { key: imageKey, onWait })
+        dec = await decodeMask(pts, { key: imageKey, onWait, prior })
     } catch (err) {
         // The embedding can disappear between encode and decode for reasons
         // that are all NORMAL: deep-idle worker shutdown, a lost GPU device,
@@ -107,43 +109,29 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
         if (!RECOVERABLE.test(String(err?.message))) throw err
         console.warn('[seglab][sam21] embedding gone; re-encoding:', err?.message)
         await encodeOnce()
-        dec = await decodeMask(pts, { key: imageKey, onWait })
+        dec = await decodeMask(pts, { key: imageKey, onWait, prior })
     }
     const decodeMs = performance.now() - t1
 
-    const t2 = performance.now()
-    const w = canvas.width
-    const h = canvas.height
-    const { rgba, rawRgba, bandPixels, regions, maskRect } =
-        await postProcessAsync(canvas, imageKey, dec.logits, w, h, proxyPts)
-
-    // Park every candidate SAM already computed, ordered small → large, so the
-    // app can answer "you took the wrong part of it" with a repaint. The
-    // inference is already paid for; the only cost is 256 KB per plane.
-    candidates = orderCandidates({
-        imageKey, canvas, w, h, clicks: proxyPts,
-        planes: [dec.logits, ...(dec.alternates || [])],
-        scores: [dec.iou, ...(dec.altScores || [])],
-    })
-
-    return {
-        rgba,
-        rawRgba,
-        width: w,
-        height: h,
+    const probe = {
+        canvas,
+        imageKey,
+        w: canvas.width,
+        h: canvas.height,
+        proxyPts,
+        fit,
+        // The grid the logits live on — probe ranking happens in this space and
+        // must not hard-code it.
+        side: dec.side || MASK_SIDE,
+        logits: dec.logits,
+        alternates: dec.alternates || [],
         score: dec.iou,
+        altScores: dec.altScores || [],
         encoded: !enc.cached,
         encodeMs: +encodeMs.toFixed(1),
         decodeMs: +decodeMs.toFixed(1),
-        postMs: +(performance.now() - t2).toFixed(1),
-        postStages: lastPostStages,
-        // hardware-fit's normaliser: postMs scales with the band the filter
-        // walked, not with the proxy's own area.
-        bandPixels,
-        maskRect,
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
-        candidates: candidateInfo(),
         // Why this candidate won, and what region hygiene removed. Debug-only,
         // but it is the difference between "the mask is wrong" and knowing which
         // of six mechanisms produced it.
@@ -152,6 +140,65 @@ export const sam21Segment = async ({ canvas, imageKey, clicks, box, onWait }) =>
             stability: dec.stability,
             refined: dec.refined,
             regions: dec.regions,
+        },
+    }
+    // A PROBE stops here. The post pipeline is ~134 ms of upsample + guided
+    // filter + hygiene, and AI Subject discards three of its four probes — so
+    // ranking happens in SAM's native 256² logit space (mask-select.probeStats)
+    // and only the winner is handed back to `sam21Finish`. Nothing else about
+    // the mask changes; post is a deterministic function of these logits.
+    if (decodeOnly) return { decodeOnly: true, ...probe }
+    return sam21Finish(probe)
+}
+
+/**
+ * Post-process one decode into the shape sam-client's tail consumes.
+ *
+ * Split out of `sam21Segment` so a decode and its post can be separated in
+ * time: `selectSubject` decodes four prompts, ranks them at 256², and calls
+ * this ONCE. Candidate parking lives here rather than beside the decode for the
+ * same reason — a probe that lost must not leave its alternates behind for the
+ * cycling control to find.
+ */
+export const sam21Finish = async (probe) => {
+    const t2 = performance.now()
+    const { canvas, imageKey, w, h, proxyPts, logits } = probe
+    const { rgba, rawRgba, bandPixels, regions, maskRect } =
+        await postProcessAsync(canvas, imageKey, logits, w, h, proxyPts, false, probe.fit)
+
+    // Park every candidate SAM already computed, ordered small → large, so the
+    // app can answer "you took the wrong part of it" with a repaint. The
+    // inference is already paid for; the only cost is 256 KB per plane.
+    candidates = orderCandidates({
+        imageKey, canvas, w, h, clicks: proxyPts,
+        planes: [logits, ...probe.alternates],
+        scores: [probe.score, ...probe.altScores],
+        fit: probe.fit,
+    })
+
+    return {
+        rgba,
+        rawRgba,
+        width: w,
+        height: h,
+        score: probe.score,
+        encoded: probe.encoded,
+        encodeMs: probe.encodeMs,
+        decodeMs: probe.decodeMs,
+        postMs: +(performance.now() - t2).toFixed(1),
+        postStages: lastPostStages,
+        // hardware-fit's normaliser: postMs scales with the band the filter
+        // walked, not with the proxy's own area.
+        bandPixels,
+        maskRect,
+        device: probe.device,
+        lane: probe.lane,
+        candidates: candidateInfo(),
+        // Which field the export path would read. Stamped onto the layer so a
+        // later export can prove the field still belongs to the mask on screen.
+        decodeId: lastField?.decodeId || 0,
+        pick: {
+            ...probe.pick,
             // Hygiene at proxy scale, which the 256² pass cannot see: the
             // upsample and the guided filter both manufacture speckle.
             postRegions: regions,
@@ -174,17 +221,28 @@ export let lastPostStages = null
 // forces a GPU→CPU readback of the whole proxy (~2.8 MB). Read it once per
 // image, not once per click. Only the in-process path uses this — the worker
 // keeps its own copy, and mask-post-client tracks which image that copy is for.
+// Holds the per-photo EDGE SUMMARY alongside the pixels: the adaptive band
+// width needs it on every click and it is a property of the photo, not the
+// click. ~114 KB against the guide's ~7 MB, and it is dropped with the guide so
+// the two can never describe different photos.
 let guideCache = null
 /** Release the in-process guide copy (memory pressure). */
 export const clearGuideCache = () => { guideCache = null }
-const guidePixels = (canvas, imageKey, w, h) => {
+const guideEntry = (canvas, imageKey, w, h) => {
     if (guideCache && guideCache.key === imageKey && guideCache.w === w && guideCache.h === h) {
-        return guideCache.px
+        return guideCache
     }
     const px = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data
-    guideCache = { key: imageKey, w, h, px }
-    return px
+    guideCache = { key: imageKey, w, h, px, edges: buildEdgeMap(px, w, h) }
+    return guideCache
 }
+
+// Monotonic id for the field `adoptPost` parks. `imageKey` alone cannot say
+// WHICH mask on a photo a field belongs to, and this module holds exactly one:
+// a second selection, or a candidate cycle, silently replaces it. The id is
+// stamped onto the layer at commit time so the export path can verify it is
+// reading the field behind the mask actually on screen.
+let decodeSeq = 0
 
 /** Record what postCompute produced. Shared by the worker and in-process paths. */
 const adoptPost = (imageKey, w, h, out) => {
@@ -192,7 +250,8 @@ const adoptPost = (imageKey, w, h, out) => {
     // Keep the continuous field for export: upscaling a THRESHOLDED mask to
     // 8256×5504 is what makes edges stair-step, and no amount of export-time
     // filtering recovers from it (§10).
-    lastField = { imageKey, w, h, field: out.field }
+    decodeSeq += 1
+    lastField = { imageKey, w, h, field: out.field, decodeId: decodeSeq }
     return {
         rgba: out.rgba,
         rawRgba: out.rawRgba,
@@ -203,17 +262,19 @@ const adoptPost = (imageKey, w, h, out) => {
 }
 
 /** In-process post — the fallback path. */
-const postProcess = (canvas, imageKey, logits, w, h, clicks = [], tight = false) => {
-    let guide = null
-    try { guide = guidePixels(canvas, imageKey, w, h) } catch { /* tainted canvas */ }
-    return adoptPost(imageKey, w, h,
-        postCompute({ logits, guide, w, h, maskSide: MASK_SIDE, clicks, tight }))
+const postProcess = (canvas, imageKey, logits, w, h, clicks = [], tight = false, fit = null) => {
+    let held = null
+    try { held = guideEntry(canvas, imageKey, w, h) } catch { /* tainted canvas */ }
+    return adoptPost(imageKey, w, h, postCompute({
+        logits, guide: held?.px || null, w, h, maskSide: MASK_SIDE, clicks, tight,
+        edges: held?.edges || null, fit,
+    }))
 }
 
 /** Off-thread post, falling back in-process so a broken worker costs jank only. */
-const postProcessAsync = async (canvas, imageKey, logits, w, h, clicks = [], tight = false) => {
-    const reply = await postAsync({ canvas, imageKey, logits, w, h, maskSide: MASK_SIDE, clicks, tight })
-    if (!reply) return postProcess(canvas, imageKey, logits, w, h, clicks, tight)
+const postProcessAsync = async (canvas, imageKey, logits, w, h, clicks = [], tight = false, fit = null) => {
+    const reply = await postAsync({ canvas, imageKey, logits, w, h, maskSide: MASK_SIDE, clicks, tight, fit })
+    if (!reply) return postProcess(canvas, imageKey, logits, w, h, clicks, tight, fit)
     return adoptPost(imageKey, w, h, unpackPost(reply))
 }
 
@@ -231,14 +292,17 @@ const postProcessAsync = async (canvas, imageKey, logits, w, h, clicks = [], tig
  */
 let candidates = null
 
-const orderCandidates = ({ imageKey, canvas, w, h, clicks, planes, scores }) => {
+const orderCandidates = ({ imageKey, canvas, w, h, clicks, planes, scores, fit }) => {
     const rows = planes
         .map((p, i) => ({ p, score: scores[i] ?? 0, area: fieldArea(p), first: i === 0 }))
         .filter((r) => r.area > 0)
         .sort((a, b) => a.area - b.area)
     if (!rows.length) return null
     const index = Math.max(0, rows.findIndex((r) => r.first))
-    return { imageKey, canvas, w, h, clicks: clicks || [], rows, index }
+    // The device's post budget rides along: a cycle runs the same pipeline as a
+    // decode and must make the same standard/fine choice, but has no caller to
+    // ask.
+    return { imageKey, canvas, w, h, clicks: clicks || [], rows, index, fit: fit || null }
 }
 
 const candidateInfo = () =>
@@ -266,12 +330,12 @@ export const sam21Cycle = async (delta = 1, imageKey = null) => {
     const n = candidates.rows.length
     candidates.index = (candidates.index + (delta < 0 ? n - 1 : 1)) % n
     const row = candidates.rows[candidates.index]
-    const { canvas, w, h, clicks } = candidates
+    const { canvas, w, h, clicks, fit } = candidates
     // Tight hygiene, which a first click does not get: cycling means "the thing
     // I pointed at, at another scope", so a plane that answers with other
     // objects is answering a question nobody asked (mask-select, tight mode).
     const { rgba, rawRgba, bandPixels, maskRect } =
-        await postProcessAsync(canvas, candidates.imageKey, row.p, w, h, clicks, true)
+        await postProcessAsync(canvas, candidates.imageKey, row.p, w, h, clicks, true, fit)
     return {
         rgba,
         rawRgba,
@@ -287,6 +351,9 @@ export const sam21Cycle = async (delta = 1, imageKey = null) => {
         device: 'webgpu',
         lane: `${LANE} (${hostMode() === 'shared' ? 'shared' : 'per-tab'})`,
         candidates: candidateInfo(),
+        // Cycling replaces the parked field, so the layer's stamp has to move
+        // with it or the next export would reject a field that IS current.
+        decodeId: lastField?.decodeId || 0,
         cycled: true,
     }
 }
@@ -296,9 +363,22 @@ export const sam21Candidates = (imageKey = null) =>
     (candidates && (!imageKey || candidates.imageKey === imageKey) ? candidateInfo() : null)
 
 let lastField = null
-/** The refined score field behind the current mask, for the export path. */
-export const currentField = (imageKey) =>
-    (lastField && (!imageKey || lastField.imageKey === imageKey) ? lastField : null)
+/**
+ * The refined score field behind the current mask, for the export path.
+ *
+ * `decodeId` is the real test. This module parks exactly ONE field, and
+ * `imageKey` cannot tell two masks of the same photo apart — so an export
+ * checking the key alone happily re-mattes whichever selection ran last, which
+ * is not necessarily the layer it was asked to export. A caller that knows
+ * which decode its mask came from passes it; one that does not (bench, debug)
+ * still gets the old behaviour.
+ */
+export const currentField = (imageKey, decodeId = null) => {
+    if (!lastField) return null
+    if (imageKey && lastField.imageKey !== imageKey) return null
+    if (decodeId != null && lastField.decodeId !== decodeId) return null
+    return lastField
+}
 
 /**
  * Export-resolution alpha, derived from the CONTINUOUS field.
@@ -313,8 +393,8 @@ export const currentField = (imageKey) =>
  * matte at that resolution. Returns RGBA at (cropW, cropH), or null when no
  * field is resident (caller keeps its own path).
  */
-export const sam21HdAlpha = ({ bitmap, imageKey, subrect, cropW, cropH }) => {
-    const held = currentField(imageKey)
+export const sam21HdAlpha = ({ bitmap, imageKey, subrect, cropW, cropH, decodeId = null }) => {
+    const held = currentField(imageKey, decodeId)
     if (!held || !cropW || !cropH) return null
     const { field, w: fw, h: fh } = held
     const { sx, sy, sw, sh } = subrect
@@ -439,7 +519,7 @@ const cropDecode = async ({ bitmap, cropKey, cropW, cropH, prompts }) => {
  * unchanged. Null means "not ours" — the caller keeps its own path.
  */
 export const sam21HdCompose = async ({
-    bitmap, imageKey, subrect, compose, emitBlob, doDecode, cropKey, prompts,
+    bitmap, imageKey, subrect, compose, emitBlob, doDecode, cropKey, prompts, decodeId = null,
 }) => {
     const cropW = bitmap?.width
     const cropH = bitmap?.height
@@ -459,7 +539,7 @@ export const sam21HdCompose = async ({
         }
     }
     // Fall back to upsampling the document's field for this rect.
-    if (!hd) hd = sam21HdAlpha({ bitmap, imageKey, subrect, cropW, cropH })
+    if (!hd) hd = sam21HdAlpha({ bitmap, imageKey, subrect, cropW, cropH, decodeId })
     if (!hd) return null
 
     // Escalation path wants the mask alone.
